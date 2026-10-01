@@ -1,0 +1,32 @@
+// Example tgc kernels. Each body describes one element; tgc makes the loop, GCC vectorizes it.
+
+__kernel void saxpy(float a, const float *x, float *y) {
+    y[tid] = a * x[tid] + y[tid];
+}
+
+// Data-dependent branch: becomes a vector compare + masked operations.
+__kernel void relu(const float *x, float *y) {
+    float v = x[tid];
+    y[tid] = v > 0.0f ? v : 0.0f;
+}
+
+// Mandelbrot escape count: a fixed-length inner loop with a predicated counter.
+__kernel void mandel(int width, float x0, float y0, float step, int16_t *iters) {
+    float cr = x0 + step * (float)(tid % width);
+    float ci = y0 + step * (float)(tid / width);
+    float zr = 0.0f, zi = 0.0f;
+    int16_t n = 0;
+    for (int k = 0; k < 32; k++) {
+        float zr2 = zr * zr, zi2 = zi * zi;
+        n += (zr2 + zi2 < 4.0f);
+        zi = 2.0f * zr * zi + ci;
+        zr = zr2 - zi2 + cr;
+    }
+    iters[tid] = n;
+}
+
+// 2-D: blend two images (16-bit channels), alpha in 0..256.
+__kernel2d void blend(int stride, int16_t *dst, const int16_t *a, const int16_t *b, int alpha) {
+    int i = ty * stride + tx;
+    dst[i] = (int16_t)((a[i] * alpha + b[i] * (256 - alpha)) >> 8);
+}

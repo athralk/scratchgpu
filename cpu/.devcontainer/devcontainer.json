@@ -1,0 +1,19 @@
+{
+  "name": "Digital Tools for Synapse",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "runArgs": [
+    // This is the key change for Linux
+    "--network=host",
+    "-e",
+    "DISPLAY=${localEnv:DISPLAY}",
+    "-e",
+    "XAUTHORITY=/tmp/.Xauthority",
+    "-v",
+    "${localEnv:HOME}/.Xauthority:/tmp/.Xauthority"
+  ],
+  "mounts": [
+    "source=/tmp/.X11-unix,target=/tmp/.X11-unix,type=bind,consistency=cached"
+  ]
+}

@@ -1,0 +1,38 @@
+# Build files
+*.bin
+*.elf
+*.hex
+*.lss
+*.o
+
+# Verilog build files
+*.fst
+*.log
+*.vcd
+*.vvp
+results.xml
+sim_build*/
+build/
+sim/.out/
+
+# Python build files
+*.pyc
+*.pyo
+__pycache__/
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# Generated Linux configuration
+sim/.config
+
+# Local agent files
+/.codex/
+/.claude/
+
+# macOS metadata
+.DS_Store
+
+# Parallel test worker dirs
+.xdist/

@@ -1,0 +1,14 @@
+# build outputs
+*.o
+*.elf
+*.bin
+*.hex
+obj/
+obj_linux/
+sim_build*/
+.xdist/
+.venv/
+__pycache__/
+results.xml
+*_results.xml
+sw/tgc/kernels.c
