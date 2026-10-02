@@ -5,8 +5,16 @@
 // Datapath: 24x24 product (DSP), addend aligned into a 76-bit window against the product
 // with a sticky bit, one add/subtract, leading-zero count, normalizing shift limited at the
 // subnormal boundary, then rounding in any of the five modes. Flags match softfloat
-// (tininess detected after rounding). Combinational; the lanes register around it.
-module fp32_fma (
+// (tininess detected after rounding).
+//
+// PIPE = 0: combinational (the element engine holds its operands for several cycles and is
+// timed as a multicycle path). PIPE = 1: two register stages, result valid two cycles after
+// the operands (stage 1 = product + addend alignment, stage 2 = add + leading-zero count,
+// then normalize/round combinationally into the caller's result register).
+module fp32_fma #(
+    parameter PIPE = 0
+) (
+    input  wire        clk,
     input  wire [31:0] a,
     input  wire [31:0] b,
     input  wire [31:0] c,
@@ -61,25 +69,69 @@ module fp32_fma (
     wire [76:0] cw = {c_shift[76:1], c_shift[0] | c_lost};
     wire [76:0] pw = {27'b0, prod, 2'b0};
     // Exponent of window bit 48: the product's, unless the addend was pinned at the top.
-    wire signed [10:0] ew = (sh_s < 0) ? (ec - 11'sd27) : ep;
+    wire signed [10:0] ew0 = (sh_s < 0) ? (ec - 11'sd27) : ep;
+
+    // Special cases, summarized for the output stage
+    wire any_nan = a_nan || b_nan || c_nan;
+    wire any_snan = a_snan || b_snan || c_snan;
+    wire inf_x_zero = (a_inf && b_zero) || (a_zero && b_inf);
+    wire ab_inf = a_inf || b_inf;
+    wire ab_zero = a_zero || b_zero;
+
+    // ---------------- Pipeline stage 1 ----------------
+    localparam W1 = 48 + 77 + 11 + 2 + 3 + 1 + 32 + 7;
+    wire [W1-1:0] st1_d = {prod, cw, ew0, sp, sc, rm, mul, c, any_nan, any_snan, inf_x_zero, ab_inf, c_inf, ab_zero, c_zero};
+    reg  [W1-1:0] st1_q;
+    always @(posedge clk) st1_q <= st1_d;
+    wire [W1-1:0] st1 = PIPE ? st1_q : st1_d;
+    wire [47:0] prod1;
+    wire [76:0] cw1;
+    wire signed [10:0] ew1;
+    wire sp1, sc1, mul1;
+    wire [2:0] rm1;
+    wire [31:0] c1;
+    wire any_nan1, any_snan1, inf_x_zero1, ab_inf1, c_inf1, ab_zero1, c_zero1;
+    assign {prod1, cw1, ew1, sp1, sc1, rm1, mul1, c1, any_nan1, any_snan1, inf_x_zero1, ab_inf1, c_inf1, ab_zero1, c_zero1} = st1;
+    wire [76:0] pw1 = {27'b0, prod1, 2'b0};
 
     // ---------------- Add / subtract ----------------
-    wire eff_sub = sp ^ sc;
-    wire [77:0] sum_add = {1'b0, pw} + {1'b0, cw};
-    wire [77:0] diff = {1'b0, pw} - {1'b0, cw};
+    // Both differences are formed at once, so the magnitude needs no negation afterwards.
+    wire eff_sub = sp1 ^ sc1;
+    wire [77:0] sum_add = {1'b0, pw1} + {1'b0, cw1};
+    wire [77:0] diff = {1'b0, pw1} - {1'b0, cw1};
+    wire [76:0] diff_r = cw1 - pw1;
     wire diff_neg = diff[77];
-    wire [76:0] mag = eff_sub ? (diff_neg ? (~diff[76:0] + 77'd1) : diff[76:0]) : sum_add[76:0];
-    wire s_res = eff_sub ? (diff_neg ? sc : sp) : sp;
+    wire [76:0] mag0 = eff_sub ? (diff_neg ? diff_r : diff[76:0]) : sum_add[76:0];
+    wire s_res0 = eff_sub ? (diff_neg ? sc1 : sp1) : sp1;
 
     // ---------------- Normalize ----------------
     // Vector bit 76 has exponent ep + 28. Shift left by the leading-zero count, but keep the
     // exponent of bit 76 >= 1 (subnormal results); a tiny product shifts right instead.
-    reg [6:0] lzc;
+    reg [6:0] lzc0;
     integer i;
     always @(*) begin
-        lzc = 7'd77;
-        for (i = 0; i < 77; i = i + 1) if (mag[i]) lzc = 7'd76 - i[6:0];
+        lzc0 = 7'd77;
+        for (i = 0; i < 77; i = i + 1) if (mag0[i]) lzc0 = 7'd76 - i[6:0];
     end
+
+    // ---------------- Pipeline stage 2 ----------------
+    localparam W2 = 77 + 1 + 7 + 11 + 2 + 3 + 1 + 32 + 7;
+    wire [W2-1:0] st2_d = {mag0, s_res0, lzc0, ew1, sp1, sc1, rm1, mul1, c1,
+                           any_nan1, any_snan1, inf_x_zero1, ab_inf1, c_inf1, ab_zero1, c_zero1};
+    reg  [W2-1:0] st2_q;
+    always @(posedge clk) st2_q <= st2_d;
+    wire [W2-1:0] st2 = PIPE ? st2_q : st2_d;
+    wire [76:0] mag;
+    wire s_res;
+    wire [6:0] lzc;
+    wire signed [10:0] ew;
+    wire sp2, sc2, mul2;
+    wire [2:0] rm2;
+    wire [31:0] c2;
+    wire any_nan2, any_snan2, inf_x_zero2, ab_inf2, c_inf2, ab_zero2, c_zero2;
+    assign {mag, s_res, lzc, ew, sp2, sc2, rm2, mul2, c2,
+            any_nan2, any_snan2, inf_x_zero2, ab_inf2, c_inf2, ab_zero2, c_zero2} = st2;
+
     wire signed [10:0] limit = ew + 11'sd27;
     reg  [76:0] norm;
     reg  signed [10:0] e_res;
@@ -119,7 +171,7 @@ module fp32_fma (
         end
     endfunction
 
-    wire inc = round_up(rm, s_res, mant[0], guard, sticky);
+    wire inc = round_up(rm2, s_res, mant[0], guard, sticky);
     wire [24:0] mant_r = {1'b0, mant} + {24'b0, inc};
     wire carry = mant_r[24];
     wire signed [10:0] e_fin = e_res + (carry ? 11'sd1 : 11'sd0);
@@ -134,31 +186,31 @@ module fp32_fma (
     wire guard_n = norm[51];
     wire sticky_n = (norm[50:0] != 0) || rsh_sticky;
     wire tiny = (e_res == 11'sd1) && !mant[23] &&
-                !(mant[22] && (&mant_n) && round_up(rm, s_res, mant_n[0], guard_n, sticky_n));
+                !(mant[22] && (&mant_n) && round_up(rm2, s_res, mant_n[0], guard_n, sticky_n));
 
     always @(*) begin
         flags = 5'b0;
-        if (a_nan || b_nan || c_nan) begin
+        if (any_nan2) begin
             result = QNAN;
-            flags[4] = a_snan || b_snan || c_snan || ((a_inf && b_zero) || (a_zero && b_inf));
-        end else if ((a_inf && b_zero) || (a_zero && b_inf)) begin
+            flags[4] = any_snan2 || inf_x_zero2;
+        end else if (inf_x_zero2) begin
             result = QNAN;
             flags[4] = 1'b1;
-        end else if (a_inf || b_inf) begin
-            if (c_inf && (sc != sp)) begin result = QNAN; flags[4] = 1'b1; end
-            else result = {sp, 8'hFF, 23'b0};
-        end else if (c_inf) begin
-            result = c;
-        end else if (a_zero || b_zero) begin
-            if (mul) result = {sp, 31'b0};
-            else if (c_zero) result = {(rm == 3'd2) ? (sp | sc) : (sp & sc), 31'b0};
-            else result = c;
+        end else if (ab_inf2) begin
+            if (c_inf2 && (sc2 != sp2)) begin result = QNAN; flags[4] = 1'b1; end
+            else result = {sp2, 8'hFF, 23'b0};
+        end else if (c_inf2) begin
+            result = c2;
+        end else if (ab_zero2) begin
+            if (mul2) result = {sp2, 31'b0};
+            else if (c_zero2) result = {(rm2 == 3'd2) ? (sp2 | sc2) : (sp2 & sc2), 31'b0};
+            else result = c2;
         end else if (mag == 0) begin
-            result = {(rm == 3'd2), 31'b0};       // exact cancellation
+            result = {(rm2 == 3'd2), 31'b0};       // exact cancellation
         end else if (e_fin >= 11'sd255) begin
             flags[2] = 1'b1;
             flags[0] = 1'b1;
-            if (rm == 3'd1 || (rm == 3'd2 && !s_res) || (rm == 3'd3 && s_res))
+            if (rm2 == 3'd1 || (rm2 == 3'd2 && !s_res) || (rm2 == 3'd3 && s_res))
                 result = {s_res, 8'hFE, 23'h7FFFFF};
             else
                 result = {s_res, 8'hFF, 23'h0};
@@ -170,3 +222,6 @@ module fp32_fma (
     end
 
 endmodule
+
+// Restore the default so this file's setting cannot leak into the next one compiled.
+`default_nettype wire

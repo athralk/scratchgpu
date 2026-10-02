@@ -1,7 +1,7 @@
 // Instruction Decode Constants
 
-`ifndef INSTR_DEFINES_VH
-`define INSTR_DEFINES_VH
+// Included inside each module that needs it (module-scope localparams are plain
+// Verilog-2001), so there is deliberately no include guard.
 
 // R-type
 localparam [6:0] INSTR_ADD   = 7'h01;
@@ -108,4 +108,4 @@ localparam [6:0] INSTR_VSTORE  = 7'h54;
 // Unknown or NOP
 localparam [6:0] INSTR_INVALID = 7'h00;
 
-`endif
+

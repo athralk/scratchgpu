@@ -1,5 +1,4 @@
 `default_nettype none
-`include "instr_defines.vh"
 module decoder (
     input  wire [31:0] instr,
     output wire [ 4:0] rs2,
@@ -14,6 +13,7 @@ module decoder (
     output wire [6:0] opcode,
     output reg  [6:0] instr_id  // changed from 32-bit one-hot to compact ID
 );
+`include "instr_defines.vh"
 
     wire is_r_instr, is_u_instr, is_s_instr, is_b_instr, is_j_instr, is_i_instr, is_csr_instr, is_amo_instr;
     wire [2:0] func3;
@@ -233,3 +233,6 @@ module decoder (
     end
 
 endmodule
+
+// Restore the default so this file's setting cannot leak into the next one compiled.
+`default_nettype wire

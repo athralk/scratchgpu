@@ -1,5 +1,4 @@
 `default_nettype none
-`include "instr_defines.vh"
 module forwarding_unit (
     // Current instruction registers to check
     input wire [4:0] rs1_addr_ex,
@@ -21,6 +20,7 @@ module forwarding_unit (
     output reg [1:0] forward_a, // For rs1
     output reg [1:0] forward_b  // For rs2
 );
+`include "instr_defines.vh"
 
     // Forwarding control values
     localparam NO_FORWARDING = 2'b00;   // Use the value from register file
@@ -79,3 +79,6 @@ module forwarding_unit (
     end
 
 endmodule
+
+// Restore the default so this file's setting cannot leak into the next one compiled.
+`default_nettype wire

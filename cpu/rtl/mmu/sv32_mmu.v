@@ -123,3 +123,6 @@ module sv32_mmu (
                                    (data_update_dirty ? 32'h00000080 : 32'h00000000);
 
 endmodule
+
+// Restore the default so this file's setting cannot leak into the next one compiled.
+`default_nettype wire

@@ -1,5 +1,4 @@
 `default_nettype none
-`include "instr_defines.vh"
 module csr_exec (
     input wire [6:0] instr_id,
     input wire [31:0] rs1_value,
@@ -9,6 +8,7 @@ module csr_exec (
     output reg csr_write_enable,
     output reg [31:0] rd_value
 );
+`include "instr_defines.vh"
 
     wire [31:0] uimm = {27'b0, rs1_addr}; // Zero-extended immediate
 
@@ -51,3 +51,6 @@ module csr_exec (
     end
 
 endmodule
+
+// Restore the default so this file's setting cannot leak into the next one compiled.
+`default_nettype wire

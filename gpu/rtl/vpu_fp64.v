@@ -251,7 +251,12 @@ module vpu_fp64 (
 endmodule
 
 // ----------------------------------------------------------------------------
-// Iterative divide / square root for any binary format (P+3 cycles).
+// Iterative divide / square root for any binary format.
+//   fp_divsqrt #(8, 23) is FP32, #(11, 52) FP64. P+3 cycles of quotient/root bits, then rounding.
+// The quotient (or root) of normalized operands always has its leading one in one of the top
+// three bit positions, so normal results round with a 3-way select. A result in the subnormal
+// range is shifted right one bit per cycle first (rare); flags match softfloat (tininess after
+// rounding).
 // ----------------------------------------------------------------------------
 module fp_divsqrt #(
     parameter EW = 11,
@@ -276,7 +281,6 @@ module fp_divsqrt #(
     localparam integer BIAS = (1 << (EW - 1)) - 1;
     localparam integer EMAX = (1 << EW) - 1;
     localparam [N-1:0] QNAN = {1'b0, {EW{1'b1}}, 1'b1, {(MW-1){1'b0}}};
-    localparam [IT:0] ONE_W = 1;
 
     function is_nan;  input [N-1:0] v; begin is_nan = (&v[N-2:MW]) && (v[MW-1:0] != 0); end endfunction
     function is_snan; input [N-1:0] v; begin is_snan = is_nan(v) && !v[MW-1]; end endfunction
@@ -297,53 +301,6 @@ module fp_divsqrt #(
         end
     endfunction
 
-    // Round and pack s * M * 2^eL, M has its leading one at or below bit IT (one extra
-    // sticky bit below the quotient), never zero.
-    function [N+4:0] round_pack;
-        input s;
-        input [IT:0] M;
-        input signed [15:0] eL;
-        input [2:0] mode;
-        integer p, lsb_pos, i;
-        reg [IT:0] mant, mant2;
-        reg g, st, g2, st2, inexact, tiny;
-        reg signed [15:0] Le, E, Eu;
-        begin
-            p = 0;
-            for (i = 0; i <= IT; i = i + 1) if (M[i]) p = i;
-            lsb_pos = p - MW;
-            if (lsb_pos < (1 - BIAS - MW) - eL) lsb_pos = (1 - BIAS - MW) - eL;
-            if (lsb_pos <= 0) begin mant = M << (-lsb_pos); g = 0; st = 0; end
-            else if (lsb_pos > p + 1) begin mant = 0; g = 0; st = 1; end
-            else begin
-                mant = M >> lsb_pos;
-                g = M[lsb_pos - 1];
-                st = (lsb_pos >= 2) ? ((M & ((ONE_W << (lsb_pos - 1)) - ONE_W)) != 0) : 1'b0;
-            end
-            inexact = g || st;
-            mant = mant + round_up(mode, s, mant[0], g, st);
-            Le = lsb_pos + eL;
-            if (mant[P]) begin mant = mant >> 1; Le = Le + 1; end
-            E = mant[P-1] ? (Le + BIAS + MW) : 0;
-            if (p - MW <= 0) begin mant2 = M << (MW - p); g2 = 0; st2 = 0; end
-            else begin
-                mant2 = M >> (p - MW);
-                g2 = M[p - MW - 1];
-                st2 = (p - MW >= 2) ? ((M & ((ONE_W << (p - MW - 1)) - ONE_W)) != 0) : 1'b0;
-            end
-            mant2 = mant2 + round_up(mode, s, mant2[0], g2, st2);
-            Eu = p + eL + BIAS + (mant2[P] ? 1 : 0);
-            tiny = (Eu < 1);
-            if (E >= EMAX) begin
-                if (mode == 3'd1 || (mode == 3'd2 && !s) || (mode == 3'd3 && s))
-                    round_pack = {5'b00101, s, {(EW-1){1'b1}}, 1'b0, {MW{1'b1}}};
-                else
-                    round_pack = {5'b00101, s, {EW{1'b1}}, {MW{1'b0}}};
-            end else
-                round_pack = {3'b0, tiny && inexact, inexact, s, E[EW-1:0], mant[MW-1:0]};
-        end
-    endfunction
-
     // Normalize a finite nonzero operand: significand with the leading one at bit P-1,
     // value = m * 2^(e - BIAS - MW)
     function [P+15:0] norm;
@@ -360,7 +317,9 @@ module fp_divsqrt #(
         end
     endfunction
 
-    reg busy, op_sqrt, s_r, special;
+    localparam S_IDLE = 3'd0, S_ITER = 3'd1, S_NORM = 3'd2, S_DENORM = 3'd3, S_ROUND = 3'd4, S_SPECIAL = 3'd5;
+    reg [2:0] st_q;
+    reg op_sqrt, s_r;
     reg [7:0] count;
     reg [2:0] rm_r;
     reg signed [15:0] eL_r;
@@ -374,93 +333,166 @@ module fp_divsqrt #(
     reg [P:0] m_rad;
     reg [2*P+4:0] trial;
 
+    // Rounding state: M = {quotient, sticky}; value = M * 2^eL_r
+    reg [IT:0] M;
+    reg msticky;                           // bits shifted out while denormalizing
+    reg [1:0] lead;                        // leading one at IT - lead
+    reg signed [15:0] E;                   // biased exponent of the leading bit
+    reg tiny_r;
+
+    // Normal-position rounding of the current M (leading one at IT - lead)
+    wire [IT:0] M_sh = (lead == 2'd0) ? (M >> (IT - MW)) : (lead == 2'd1) ? (M >> (IT - 1 - MW)) : (M >> (IT - 2 - MW));
+    wire [P-1:0] mant = M_sh[P-1:0];
+    wire g_bit = (lead == 2'd0) ? M[IT - MW - 1] : (lead == 2'd1) ? M[IT - MW - 2] : M[IT - MW - 3];
+    wire [IT:0] below_mask = (lead == 2'd0) ? ((1 << (IT - MW - 1)) - 1) : (lead == 2'd1) ? ((1 << (IT - MW - 2)) - 1) : ((1 << (IT - MW - 3)) - 1);
+    wire st_bit = ((M & below_mask) != 0) || msticky;
+    wire inc = round_up(rm_r, s_r, mant[0], g_bit, st_bit);
+    wire [P:0] mant_r = {1'b0, mant} + inc;
+
     always @(posedge clk or posedge rst) begin
         if (rst) begin
-            busy <= 1'b0;
+            st_q <= S_IDLE;
             done <= 1'b0;
             count <= 0;
+            result <= 0;
+            flags <= 0;
         end else begin
             done <= 1'b0;
-            if (start && !busy) begin
-                op_sqrt <= is_sqrt;
-                rm_r <= rm;
-                special <= 1'b1;
-                special_flags <= 5'b0;
-                busy <= 1'b1;
-                if (is_sqrt) begin
-                    s_r <= 1'b0;
-                    if (is_nan(x)) begin special_val <= QNAN; special_flags <= {is_snan(x), 4'b0}; end
-                    else if (is_zero(x)) special_val <= x;
-                    else if (x[N-1]) begin special_val <= QNAN; special_flags <= 5'b10000; end
-                    else if (is_inf(x)) special_val <= x;
-                    else begin
-                        special <= 1'b0;
-                        nx = norm(x);
-                        t = nx[P+15:P] - (BIAS + MW);
-                        if (t[0]) begin m_rad = {nx[P-1:0], 1'b0}; t = t - 1; end
-                        else m_rad = {1'b0, nx[P-1:0]};
-                        // root = floor(sqrt(m_rad << SE)), SE the even shift that fits (P+4 or P+3)
-                        rad <= {{(RW-P-1){1'b0}}, m_rad} << (SE + 2);
-                        eL_r <= ((t - SE) >>> 1) - 1;
-                        rem <= 0;
-                        q <= 0;
-                        count <= 0;
-                    end
-                end else begin
-                    s_r <= x[N-1] ^ y[N-1];
-                    if (is_nan(x) || is_nan(y)) begin
-                        special_val <= QNAN; special_flags <= {is_snan(x) || is_snan(y), 4'b0};
-                    end else if ((is_inf(x) && is_inf(y)) || (is_zero(x) && is_zero(y))) begin
-                        special_val <= QNAN; special_flags <= 5'b10000;
-                    end else if (is_inf(x) || is_zero(y)) begin
-                        special_val <= {x[N-1] ^ y[N-1], {EW{1'b1}}, {MW{1'b0}}};
-                        special_flags <= (is_zero(y) && !is_inf(x)) ? 5'b01000 : 5'b0;
-                    end else if (is_zero(x) || is_inf(y)) begin
-                        special_val <= {x[N-1] ^ y[N-1], {(N-1){1'b0}}};
+            case (st_q)
+                S_IDLE: if (start) begin
+                    op_sqrt <= is_sqrt;
+                    rm_r <= rm;
+                    special_flags <= 5'b0;
+                    st_q <= S_SPECIAL;
+                    if (is_sqrt) begin
+                        s_r <= 1'b0;
+                        if (is_nan(x)) begin special_val <= QNAN; special_flags <= {is_snan(x), 4'b0}; end
+                        else if (is_zero(x)) special_val <= x;
+                        else if (x[N-1]) begin special_val <= QNAN; special_flags <= 5'b10000; end
+                        else if (is_inf(x)) special_val <= x;
+                        else begin
+                            st_q <= S_ITER;
+                            nx = norm(x);
+                            t = nx[P+15:P] - (BIAS + MW);
+                            if (t[0]) begin m_rad = {nx[P-1:0], 1'b0}; t = t - 1; end
+                            else m_rad = {1'b0, nx[P-1:0]};
+                            // root = floor(sqrt(m_rad << SE))
+                            rad <= {{(RW-P-1){1'b0}}, m_rad} << (SE + 2);
+                            eL_r <= ((t - SE) >>> 1) - 1;
+                            rem <= 0;
+                            q <= 0;
+                            count <= 0;
+                        end
                     end else begin
-                        special <= 1'b0;
-                        nx = norm(x);
-                        ny = norm(y);
-                        rem <= nx[P-1:0];
-                        divisor <= ny[P-1:0];
-                        eL_r <= nx[P+15:P] - ny[P+15:P] - (P + 2) - 1;
-                        q <= 0;
-                        count <= 0;
+                        s_r <= x[N-1] ^ y[N-1];
+                        if (is_nan(x) || is_nan(y)) begin
+                            special_val <= QNAN; special_flags <= {is_snan(x) || is_snan(y), 4'b0};
+                        end else if ((is_inf(x) && is_inf(y)) || (is_zero(x) && is_zero(y))) begin
+                            special_val <= QNAN; special_flags <= 5'b10000;
+                        end else if (is_inf(x) || is_zero(y)) begin
+                            special_val <= {x[N-1] ^ y[N-1], {EW{1'b1}}, {MW{1'b0}}};
+                            special_flags <= (is_zero(y) && !is_inf(x)) ? 5'b01000 : 5'b0;
+                        end else if (is_zero(x) || is_inf(y)) begin
+                            special_val <= {x[N-1] ^ y[N-1], {(N-1){1'b0}}};
+                        end else begin
+                            st_q <= S_ITER;
+                            nx = norm(x);
+                            ny = norm(y);
+                            rem <= nx[P-1:0];
+                            divisor <= ny[P-1:0];
+                            eL_r <= nx[P+15:P] - ny[P+15:P] - (P + 2) - 1;
+                            q <= 0;
+                            count <= 0;
+                        end
                     end
                 end
-            end else if (busy) begin
-                if (special) begin
-                    busy <= 1'b0;
+
+                S_SPECIAL: begin
+                    st_q <= S_IDLE;
                     done <= 1'b1;
                     result <= special_val;
                     flags <= special_flags;
-                end else if (count != IT) begin
-                    count <= count + 1;
-                    if (op_sqrt) begin
-                        trial = {rem[2*P+2:0], rad[RW-1:RW-2]} - {q, 2'b01};
-                        if (!trial[2*P+4]) begin
-                            rem <= trial;
-                            q <= {q[IT-1:0], 1'b1};
-                        end else begin
-                            rem <= {rem[2*P+2:0], rad[RW-1:RW-2]};
-                            q <= {q[IT-1:0], 1'b0};
-                        end
-                        rad <= rad << 2;
-                    end else begin
-                        if (rem >= divisor) begin
-                            rem <= (rem - divisor) << 1;
-                            q <= {q[IT-1:0], 1'b1};
-                        end else begin
-                            rem <= rem << 1;
-                            q <= {q[IT-1:0], 1'b0};
-                        end
-                    end
-                end else begin
-                    busy <= 1'b0;
-                    done <= 1'b1;
-                    {flags, result} <= round_pack(s_r, {q[IT-1:0], (rem != 0)}, eL_r, rm_r);
                 end
-            end
+
+                S_ITER: begin
+                    if (count != IT) begin
+                        count <= count + 1;
+                        if (op_sqrt) begin
+                            trial = {rem[2*P+2:0], rad[RW-1:RW-2]} - {q, 2'b01};
+                            if (!trial[2*P+4]) begin
+                                rem <= trial;
+                                q <= {q[IT-1:0], 1'b1};
+                            end else begin
+                                rem <= {rem[2*P+2:0], rad[RW-1:RW-2]};
+                                q <= {q[IT-1:0], 1'b0};
+                            end
+                            rad <= rad << 2;
+                        end else begin
+                            if (rem >= divisor) begin
+                                rem <= (rem - divisor) << 1;
+                                q <= {q[IT-1:0], 1'b1};
+                            end else begin
+                                rem <= rem << 1;
+                                q <= {q[IT-1:0], 1'b0};
+                            end
+                        end
+                    end else begin
+                        M <= {q[IT-1:0], (rem != 0)};
+                        msticky <= 1'b0;
+                        st_q <= S_NORM;
+                    end
+                end
+
+                S_NORM: begin
+                    // Leading one is in the top three bits; its biased exponent follows.
+                    lead <= M[IT] ? 2'd0 : M[IT-1] ? 2'd1 : 2'd2;
+                    E <= eL_r + BIAS + (M[IT] ? IT : M[IT-1] ? IT - 1 : IT - 2);
+                    st_q <= S_DENORM;
+                end
+
+                S_DENORM: begin
+                    if (E == 16'sd0 && !count[7]) begin
+                        // Just below the normal range: tiny unless rounding at full precision
+                        // reaches the smallest normal. Decided before any shifting.
+                        tiny_r <= !mant_r[P];
+                        count[7] <= 1'b1;
+                    end else if (E < 16'sd0 && !count[7]) begin
+                        tiny_r <= 1'b1;
+                        count[7] <= 1'b1;
+                    end else if (E < 16'sd1) begin
+                        // Subnormal: shift right one bit per cycle up to exponent 1
+                        M <= M >> 1;
+                        msticky <= msticky | M[0];
+                        E <= E + 1;
+                        if (M == 0) E <= 16'sd1;        // everything is sticky now
+                    end else begin
+                        if (!count[7]) tiny_r <= 1'b0;
+                        st_q <= S_ROUND;
+                    end
+                end
+
+                S_ROUND: begin
+                    st_q <= S_IDLE;
+                    done <= 1'b1;
+                    if (E + (mant_r[P] ? 1 : 0) >= EMAX) begin
+                        flags <= 5'b00101;
+                        if (rm_r == 3'd1 || (rm_r == 3'd2 && !s_r) || (rm_r == 3'd3 && s_r))
+                            result <= {s_r, {(EW-1){1'b1}}, 1'b0, {MW{1'b1}}};
+                        else
+                            result <= {s_r, {EW{1'b1}}, {MW{1'b0}}};
+                    end else begin
+                        flags <= {3'b0, tiny_r && (g_bit || st_bit), g_bit || st_bit};
+                        if (mant_r[P])
+                            result <= {s_r, E[EW-1:0] + 1'b1, {MW{1'b0}}};   // carry: 1.000.. at E+1
+                        else if (mant_r[P-1])
+                            result <= {s_r, E[EW-1:0], mant_r[MW-1:0]};
+                        else
+                            result <= {s_r, {EW{1'b0}}, mant_r[MW-1:0]};      // subnormal
+                    end
+                end
+
+                default: st_q <= S_IDLE;
+            endcase
         end
     end
 

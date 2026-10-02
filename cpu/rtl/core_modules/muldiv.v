@@ -1,5 +1,4 @@
 `default_nettype none
-`include "instr_defines.vh"
 // Multi-cycle RV32M unit for the EX stage.
 //
 // One shared 33x33 signed multiplier (two register stages so it maps onto DSP48E1
@@ -19,6 +18,7 @@ module muldiv (
     output wire ready,
     output wire [31:0] result
 );
+`include "instr_defines.vh"
 
     localparam [2:0] S_IDLE = 3'd0,
                      S_MUL1 = 3'd1,
@@ -132,3 +132,6 @@ module muldiv (
     assign result = result_q;
 
 endmodule
+
+// Restore the default so this file's setting cannot leak into the next one compiled.
+`default_nettype wire

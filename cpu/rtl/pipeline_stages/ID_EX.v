@@ -1,4 +1,3 @@
-`include "instr_defines.vh"
 module ID_EX(
     input wire clk,
     input wire rst,
@@ -39,6 +38,7 @@ module ID_EX(
     output reg instr_valid_out,
     output reg instr_page_fault_out
 );
+`include "instr_defines.vh"
     always @(posedge clk or posedge rst) begin
         if (rst) begin
             rs1_valid_out <= 1'b0;

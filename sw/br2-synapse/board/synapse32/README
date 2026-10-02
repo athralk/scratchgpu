@@ -1,0 +1,8 @@
+Synapse-32 board files for Buildroot.
+
+synapse32.dts  device tree (CPU, 256 MB DRAM, CLINT, PLIC, 16550 UART)
+synapse32.dtb  compiled copy that OpenSBI embeds and passes to the kernel.
+               After editing the .dts, regenerate it:
+                   dtc -I dts -O dtb -o synapse32.dtb synapse32.dts
+linux.fragment kernel options on top of rv32_defconfig
+post-image.sh  writes images/synapse.bin (for the board) and images/synapse.hex (simulator)

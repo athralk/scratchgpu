@@ -11,7 +11,7 @@
 // coherent with scalar code and translated with the same permissions. The CPU stays in
 // MEM until a load/store finishes; a fault reports the element index for vstart.
 module vpu_top #(
-    parameter LANES = 8           // SIMD lanes for the SEW=32 fast path (8 or 16)
+    parameter LANES = 4           // SIMD lanes for the SEW=32 fast path (4, 8 or 16)
 ) (
     input  wire        clk,
     input  wire        rst,
@@ -262,9 +262,19 @@ module vpu_top #(
     // ======================================================================
     // Scalar FP registers (RV32F/D): 32 x 64-bit, singles NaN-boxed
     // ======================================================================
-    reg [63:0] freg [0:31];
+    // Two 32 x 32 LUT-RAM halves (FLD writes them separately), one write port, three read
+    // addresses: rs1 (also the .vf operand at dispatch), rs2 (also FSW/FSD data), rs3.
+    reg [31:0] freg_lo [0:31];
+    reg [31:0] freg_hi [0:31];
     integer fi;
-    initial for (fi = 0; fi < 32; fi = fi + 1) freg[fi] = 64'h0;
+    initial for (fi = 0; fi < 32; fi = fi + 1) begin freg_lo[fi] = 32'h0; freg_hi[fi] = 32'h0; end
+    reg        fw_lo, fw_hi;
+    reg [4:0]  fw_a;
+    reg [63:0] fw_d;
+    always @(posedge clk) begin
+        if (fw_lo) freg_lo[fw_a] <= fw_d[31:0];
+        if (fw_hi) freg_hi[fw_a] <= fw_d[63:32];
+    end
     function [31:0] unbox;            // a single read from a register that is not boxed is the canonical NaN
         input [63:0] v;
         begin
@@ -275,9 +285,10 @@ module vpu_top #(
     wire c_is_sfp_mem = (c_kind == VK_SFLD) || (c_kind == VK_SFST);
     wire c_dbl = c_is_sfp_mem ? (c_instr[14:12] == 3'b011) : (c_instr[26:25] == 2'b01);
     wire [2:0] c_srm = (c_instr[14:12] == 3'b111) ? c_frm : c_instr[14:12];
-    wire [63:0] sf1 = freg[c_vs1];    // rs1
-    wire [63:0] sf2 = freg[c_vs2];    // rs2
-    wire [63:0] sf3 = freg[c_rs3];
+    wire [4:0]  sf1_a;                // c_vs1, or the head instruction's rs1 while dispatching
+    wire [63:0] sf1 = {freg_hi[sf1_a], freg_lo[sf1_a]};     // rs1
+    wire [63:0] sf2 = {freg_hi[c_vs2], freg_lo[c_vs2]};     // rs2
+    wire [63:0] sf3 = {freg_hi[c_rs3], freg_lo[c_rs3]};     // rs3
 
     // ======================================================================
     // Sequencer state
@@ -306,10 +317,34 @@ module vpu_top #(
     wire [31:0] a_elem = ext(vA, offA, eewA);
     wire [31:0] b_elem = ext(vB, offB, eewB);
     wire [31:0] d_elem = ext(vD, offD, eewD);
-    wire [31:0] a_raw = a_elem;
-    wire [31:0] b_vec = b_elem;
+
+    // ---------------- Element timing ----------------
+    // Each element of the sequencer (S_RUN) and each scalar FP op (S_SFP) runs in phases:
+    //   ph 0      fetch: the element's operands (and mask bits) are registered (mcx_*)
+    //   ph 1      gathers only: refetch vs2 at the index just registered
+    //   ph 2..4   compute, combinationally from mcx_* (and the instruction registers)
+    //   end ph 4  capture: results, write decisions and flags are registered (mcy_*, mcz_*)
+    //   ph 5      write back from the captured values; advance
+    // The compute logic (FMA, multiplier, conversions, FP64) is therefore given three clock
+    // cycles (four for scalar FP, which also uses ph 1) and is constrained as a multicycle path
+    // from mcx_* / c_* / e / acc / v0 to mcy_* / mcz_* (see soc_timing.xdc). Nothing on those
+    // paths may change between fetch and capture; the phase sequence guarantees it.
+    localparam [2:0] PH_FETCH = 3'd0, PH_FETCH2 = 3'd1, PH_CAP = 3'd4, PH_WR = 3'd5;
+    reg  [2:0]  ph;
+    reg  [31:0] mcx_a, mcx_b, mcx_d;
+    reg         mcx_ma, mcx_mb;          // mask bit e of the vs2 / vs1 registers
+    reg  [63:0] mcx_s1, mcx_s2, mcx_s3;  // scalar FP operands
+    reg  [31:0] red_next;                // reduction fold value (below)
+    reg  [63:0] mcz_wd;                  // captured scalar FP results (below)
+    reg  [31:0] mcz_resp;
+    reg  [4:0]  mcz_fl;
+    // vfredusum that saw no active element, with vs1[0] a NaN (found = some element was active)
+    wire red_none_nan = (c_kind == VK_RED) && (c_funct3 == F3_OPFVV) && (c_funct6 == 6'b000001) &&
+                        !found && !mask_on && (acc[30:23] == 8'hFF) && (acc[22:0] != 23'b0);
+    wire [31:0] a_raw = mcx_a;
+    wire [31:0] b_vec = mcx_b;
     wire [31:0] b_raw = is_vv ? b_vec : is_vi ? simm : c_rs1;
-    wire [31:0] d_raw = d_elem;
+    wire [31:0] d_raw = mcx_d;
 
     // ======================================================================
     // Integer element operation (SEW / widening / narrowing)
@@ -343,6 +378,35 @@ module vpu_top #(
         .b(div_signed ? sx(b_raw, c_sew) : zx(b_raw, c_sew)),
         .ready(div_ready), .result(div_result)
     );
+
+    // One shared 33x33 signed multiplier for every integer multiply (vmul*, vmacc family,
+    // widening multiplies, vsmul): operands are sign- or zero-extended to 33 bits per op.
+    reg  signed [32:0] m_x, m_y;
+    always @(*) begin : mul_operands
+        reg [32:0] as33, au33, bs33, bu33, ds33;
+        reg [31:0] t_as, t_bs, t_ds;
+        t_as = sx(a_raw, c_eew_s2);
+        t_bs = sx(b_raw, c_eew_s1);
+        t_ds = sx(d_raw, c_eew_d);
+        as33 = {t_as[31], t_as};
+        au33 = {1'b0, zx(a_raw, c_eew_s2)};
+        bs33 = {t_bs[31], t_bs};
+        bu33 = {1'b0, zx(b_raw, c_eew_s1)};
+        ds33 = {t_ds[31], t_ds};
+        m_x = as33; m_y = bs33;                                   // vmul, vmulh, vwmul, vsmul
+        case (c_funct6)
+            6'b100100, 6'b111000: begin m_x = au33; m_y = bu33; end   // vmulhu, vwmulu
+            6'b100110, 6'b111010: begin m_x = as33; m_y = bu33; end   // vmulhsu, vwmulsu
+            6'b101001, 6'b101011: begin m_x = bs33; m_y = ds33; end   // vmadd, vnmsub
+            6'b101101, 6'b101111: begin m_x = bs33; m_y = as33; end   // vmacc, vnmsac
+            6'b111100: begin m_x = bu33; m_y = au33; end              // vwmaccu
+            6'b111101: begin m_x = bs33; m_y = as33; end              // vwmacc
+            6'b111110: begin m_x = bu33; m_y = as33; end              // vwmaccus
+            6'b111111: begin m_x = bs33; m_y = au33; end              // vwmaccsu
+            default: ;
+        endcase
+    end
+    wire signed [65:0] m_prod = m_x * m_y;
 
     always @(*) begin : int_alu
         reg [63:0] as, au, bs, bu, ds, prod, wide, sum;
@@ -431,7 +495,7 @@ module vpu_top #(
                 end
                 6'b100101: r_val = a_raw << (is_vi ? uimm[5:0] & (sewbits - 6'd1) : sh); // vsll
                 6'b100111: begin                                              // vsmul
-                    prod = as * bs;
+                    prod = m_prod[63:0];
                     sum = $signed(prod) >>> (sewbits - 6'd1);
                     sum = sum + {63'b0, round_inc(prod, sewbits - 6'd1, c_vxrm)};
                     if ($signed(sum) > smax) begin r_val = smax[31:0]; r_sat = 1'b1; end
@@ -477,14 +541,14 @@ module vpu_top #(
                 6'b001010: begin sum = au - bu; r_val = sum[32:1] + {31'b0, round_inc(sum, 6'd1, c_vxrm)}; end // vasubu
                 6'b001011: begin sum = as - bs; r_val = sum[32:1] + {31'b0, round_inc(sum, 6'd1, c_vxrm)}; end // vasub
                 // High halves: bits [2*SEW-1:SEW] of the 64-bit product (truncated on write)
-                6'b100100: begin prod = au * bu; wide = prod >> sewbits; r_val = wide[31:0]; end  // vmulhu
-                6'b100101: begin prod = as * bs; r_val = prod[31:0]; end                         // vmul
-                6'b100110: begin prod = as * bu; wide = prod >> sewbits; r_val = wide[31:0]; end  // vmulhsu
-                6'b100111: begin prod = as * bs; wide = prod >> sewbits; r_val = wide[31:0]; end  // vmulh
-                6'b101001: begin prod = bs * ds; r_val = prod[31:0] + as[31:0]; end          // vmadd
-                6'b101011: begin prod = bs * ds; r_val = as[31:0] - prod[31:0]; end          // vnmsub
-                6'b101101: begin prod = bs * as; r_val = prod[31:0] + ds[31:0]; end          // vmacc
-                6'b101111: begin prod = bs * as; r_val = ds[31:0] - prod[31:0]; end          // vnmsac
+                6'b100100: begin prod = m_prod[63:0]; wide = prod >> sewbits; r_val = wide[31:0]; end  // vmulhu
+                6'b100101: begin prod = m_prod[63:0]; r_val = prod[31:0]; end                         // vmul
+                6'b100110: begin prod = m_prod[63:0]; wide = prod >> sewbits; r_val = wide[31:0]; end  // vmulhsu
+                6'b100111: begin prod = m_prod[63:0]; wide = prod >> sewbits; r_val = wide[31:0]; end  // vmulh
+                6'b101001: begin prod = m_prod[63:0]; r_val = prod[31:0] + as[31:0]; end          // vmadd
+                6'b101011: begin prod = m_prod[63:0]; r_val = as[31:0] - prod[31:0]; end          // vnmsub
+                6'b101101: begin prod = m_prod[63:0]; r_val = prod[31:0] + ds[31:0]; end          // vmacc
+                6'b101111: begin prod = m_prod[63:0]; r_val = ds[31:0] - prod[31:0]; end          // vnmsac
                 // widening: operands at SEW (or 2*SEW for .w), result 2*SEW
                 6'b110000: r_val = au[31:0] + bu[31:0];                       // vwaddu
                 6'b110001: r_val = as[31:0] + bs[31:0];                       // vwadd
@@ -494,13 +558,13 @@ module vpu_top #(
                 6'b110101: r_val = as[31:0] + bs[31:0];                       // vwadd.w
                 6'b110110: r_val = au[31:0] - bu[31:0];                       // vwsubu.w
                 6'b110111: r_val = as[31:0] - bs[31:0];                       // vwsub.w
-                6'b111000: begin prod = au * bu; r_val = prod[31:0]; end      // vwmulu
-                6'b111010: begin prod = as * bu; r_val = prod[31:0]; end      // vwmulsu (vs2 signed)
-                6'b111011: begin prod = as * bs; r_val = prod[31:0]; end      // vwmul
-                6'b111100: begin prod = bu * au; r_val = prod[31:0] + d_raw; end   // vwmaccu
-                6'b111101: begin prod = bs * as; r_val = prod[31:0] + d_raw; end   // vwmacc
-                6'b111110: begin prod = bu * as; r_val = prod[31:0] + d_raw; end   // vwmaccus (rs1 unsigned)
-                6'b111111: begin prod = bs * au; r_val = prod[31:0] + d_raw; end   // vwmaccsu (vs1 signed)
+                6'b111000: begin prod = m_prod[63:0]; r_val = prod[31:0]; end      // vwmulu
+                6'b111010: begin prod = m_prod[63:0]; r_val = prod[31:0]; end      // vwmulsu (vs2 signed)
+                6'b111011: begin prod = m_prod[63:0]; r_val = prod[31:0]; end      // vwmul
+                6'b111100: begin prod = m_prod[63:0]; r_val = prod[31:0] + d_raw; end   // vwmaccu
+                6'b111101: begin prod = m_prod[63:0]; r_val = prod[31:0] + d_raw; end   // vwmacc
+                6'b111110: begin prod = m_prod[63:0]; r_val = prod[31:0] + d_raw; end   // vwmaccus (rs1 unsigned)
+                6'b111111: begin prod = m_prod[63:0]; r_val = prod[31:0] + d_raw; end   // vwmaccsu (vs1 signed)
                 default: r_val = 32'b0;
             endcase
         end
@@ -542,10 +606,10 @@ module vpu_top #(
     reg  [31:0] sf_a, sf_b, sf_d;
     always @(*) begin
         sf_f6 = 6'b000000; sf_v1 = 5'd0;
-        sf_a = unbox(sf1); sf_b = unbox(sf2); sf_d = 32'b0;
+        sf_a = unbox(mcx_s1); sf_b = unbox(mcx_s2); sf_d = 32'b0;
         if (sop != 7'b1010011) begin
             // fused: rs1*rs2 + rs3 -> vfmadd family (b*d + a)
-            sf_b = unbox(sf1); sf_d = unbox(sf2); sf_a = unbox(sf3);
+            sf_b = unbox(mcx_s1); sf_d = unbox(mcx_s2); sf_a = unbox(mcx_s3);
             case (sop)
                 7'b1000011: sf_f6 = 6'b101000;   // fmadd  -> vfmadd
                 7'b1000111: sf_f6 = 6'b101010;   // fmsub  -> vfmsub
@@ -609,8 +673,8 @@ module vpu_top #(
     wire [63:0] fd_res;
     wire [4:0]  fd_flags;
     vpu_fp64 fpu64 (
-        .op(d_op), .x(sf1), .y(sf2), .z(sf3),
-        .xi((sfn == 5'b01000) ? unbox(sf1) : c_rs1), .rm(c_srm),
+        .op(d_op), .x(mcx_s1), .y(mcx_s2), .z(mcx_s3),
+        .xi((sfn == 5'b01000) ? unbox(mcx_s1) : c_rs1), .rm(c_srm),
         .result(fd_res), .flags(fd_flags)
     );
     wire sf_is_div  = (sop == 7'b1010011) && (sfn == 5'b00011 || sfn == 5'b01011);
@@ -619,11 +683,9 @@ module vpu_top #(
     wire [31:0] fds32_res;
     wire [63:0] fds64_res;
     wire [4:0] fds32_fl, fds64_fl;
-    fp32_divsqrt sdiv32 (
-        .clk(clk), .rst(rst), .start(sf_div_start && !c_dbl), .is_sqrt(sfn == 5'b01011),
-        .x(unbox(sf1)), .y(unbox(sf2)), .rm(c_srm),
-        .done(fds32_done), .result(fds32_res), .flags(fds32_fl)
-    );
+    assign fds32_done = fdiv_done;
+    assign fds32_res = fdiv_result;
+    assign fds32_fl = fdiv_flags;
     fp_divsqrt #(.EW(11), .MW(52)) sdiv64 (
         .clk(clk), .rst(rst), .start(sf_div_start && c_dbl), .is_sqrt(sfn == 5'b01011),
         .x(sf1), .y(sf2), .rm(c_srm),
@@ -641,12 +703,17 @@ module vpu_top #(
     wire fdiv_done;
     wire [31:0] fdiv_result;
     wire [4:0] fdiv_flags;
-    fp32_divsqrt fdivsqrt (
+    // One FP32 divide/sqrt unit, shared by vfdiv/vfrdiv/vfsqrt and scalar fdiv.s/fsqrt.s
+    // (the coprocessor runs one instruction at a time, so they never overlap).
+    wire c_sfp_div = (c_kind == VK_SFP) && (c_instr[6:0] == 7'b1010011) &&
+                     (c_instr[31:27] == 5'b00011 || c_instr[31:27] == 5'b01011);
+    fp_divsqrt #(.EW(8), .MW(23)) fdivsqrt (
         .clk(clk), .rst(rst),
-        .start(fdiv_start), .is_sqrt(c_funct6 == 6'b010011),
-        .x(c_funct6 == 6'b100001 ? fp_b : fp_a),
-        .y(c_funct6 == 6'b100001 ? fp_a : fp_b),
-        .rm(c_frm),
+        .start(c_sfp_div ? (sf_div_start && !c_dbl) : fdiv_start),
+        .is_sqrt(c_sfp_div ? (c_instr[31:27] == 5'b01011) : (c_funct6 == 6'b010011)),
+        .x(c_sfp_div ? unbox(sf1) : (c_funct6 == 6'b100001 ? fp_b : fp_a)),
+        .y(c_sfp_div ? unbox(sf2) : (c_funct6 == 6'b100001 ? fp_a : fp_b)),
+        .rm(c_sfp_div ? c_srm : c_frm),
         .done(fdiv_done), .result(fdiv_result), .flags(fdiv_flags)
     );
 
@@ -666,8 +733,10 @@ module vpu_top #(
     wire mem_busy_req = (mem_rd || mem_wr) && !mem_setup;
     wire mem_chain = (state == S_MEM) && mem_busy_req && mem_rvalid && !mem_load_pf && !mem_store_pf &&
                      !(!nx_fld_adv && last_elem) && nx_active;
-    wire [9:0] ae = mem_chain ? nx_e : e;          // element whose address is generated
-    wire [2:0] af = mem_chain ? nx_f : fld;
+    // While an access is outstanding the address/data logic already works on the next element,
+    // so a hit only selects it (mem_chain) instead of starting the index -> address chain.
+    wire [9:0] ae = mem_busy_req ? nx_e : e;       // element whose address is generated
+    wire [2:0] af = mem_busy_req ? nx_f : fld;
     reg  [31:0] elem_addr;
     always @(*) begin
         case (c_kind)
@@ -681,7 +750,7 @@ module vpu_top #(
     // Data register of field fld (loads write it), and of the field whose data a store sends next
     wire [4:0] fld_reg = c_vd + fld * c_field_regs;
     wire [4:0] st_reg  = c_vd + af * c_field_regs;
-    wire [31:0] st_data = c_is_sfp_mem ? (ae[0] ? freg[c_vs2][63:32] : freg[c_vs2][31:0]) : d_elem;
+    wire [31:0] st_data = c_is_sfp_mem ? (ae[0] ? sf2[63:32] : sf2[31:0]) : d_elem;
 
     // An access is set up one cycle before it is requested, so the D-cache's early index
     // (mem_addr_next) always matches the address it then answers for.
@@ -774,7 +843,7 @@ module vpu_top #(
                          (h_vtype[2:0] == 3'b011) ? 4'd8 : 4'd1;
 
     reg  [4:0] f_beat, f_last;
-    reg  [1:0] f_drain;
+    reg  [2:0] f_drain;
     wire [3:0] f_reg  = f_beat / BPR;
     wire [3:0] f_half = f_beat % BPR;
     wire [9:0] f_base = {f_reg, 4'b0} + f_half * LANES;    // first element of the beat
@@ -834,7 +903,7 @@ module vpu_top #(
                 la = loc(c_vs2, src, c_sew); eewA = c_sew;
             end
             VK_GATHER, VK_GATHER16: begin
-                gidx = is_vv ? b_elem : is_vi ? uimm : c_rs1;
+                gidx = is_vv ? mcx_b : is_vi ? uimm : c_rs1;
                 la = loc(c_vs2, gidx[9:0], c_sew); eewA = c_sew;
             end
             VK_VMVNR: begin
@@ -878,6 +947,47 @@ module vpu_top #(
         end
     end
 
+    // ---------------- Captured element results (end of ph 4) ----------------
+    reg        mcy_wr_en;
+    reg [8:0]  mcy_wr_word;
+    reg [31:0] mcy_wr_mask, mcy_wr_val, mcy_red;
+    reg [4:0]  mcy_fl;
+    reg        mcy_sat;
+    always @(posedge clk) begin
+        if (state == S_RUN && ph == PH_CAP) begin
+            mcy_wr_en <= wr_en;
+            mcy_wr_word <= wr_word;
+            mcy_wr_mask <= wr_mask;
+            mcy_wr_val <= wr_val;
+            mcy_red <= red_next;
+            mcy_fl <= fp_flags;
+            mcy_sat <= r_sat;
+        end
+    end
+    wire        wp_run  = (state == S_RUN);
+    wire        wp_en   = wp_run ? (ph == PH_WR && mcy_wr_en) : wr_en;
+    wire [8:0]  wp_word = wp_run ? mcy_wr_word : wr_word;
+    wire [31:0] wp_mask = wp_run ? mcy_wr_mask : wr_mask;
+    wire [31:0] wp_val  = wp_run ? mcy_wr_val : wr_val;
+
+    // Operand fetch (ph 0, and ph 1 for gathers)
+    always @(posedge clk) begin
+        if (state == S_RUN && (ph == PH_FETCH || ph == PH_FETCH2)) begin
+            if (ph == PH_FETCH) begin
+                mcx_b <= b_elem;
+                mcx_d <= d_elem;
+                mcx_mb <= vB[e[8:0]];
+            end
+            mcx_a <= a_elem;
+            mcx_ma <= vA[e[8:0]];
+        end
+        if (state == S_SFP && ph == PH_FETCH) begin
+            mcx_s1 <= sf1;
+            mcx_s2 <= sf2;
+            mcx_s3 <= sf3;
+        end
+    end
+
     // ---------------- Write port: lanes, or the element sequencer's merged word ----------------
     integer wl;
     always @(*) begin
@@ -890,16 +1000,74 @@ module vpu_top #(
                 w_en[ln_wword[3:0] + wl] = ln_active[wl];
                 w_data[(ln_wword[3:0] + wl) * 32 +: 32] = ln_result[32*wl +: 32];
             end
-        end else if (wr_en) begin
-            w_en[wr_word[3:0]] = 1'b1;
-            w_data = {16{(vD[{wr_word[3:0], 5'b0} +: 32] & ~wr_mask) | (wr_val & wr_mask)}};
+        end else if (wp_en) begin
+            w_en[wp_word[3:0]] = 1'b1;
+            w_data = {16{(vD[{wp_word[3:0], 5'b0} +: 32] & ~wp_mask) | (wp_val & wp_mask)}};
+        end
+    end
+
+    // ---------------- FP register write port (same cycle as the result) ----------------
+    assign sf1_a = (state == S_IDLE) ? h_instr[19:15] : c_vs1;
+    always @(*) begin
+        fw_lo = 1'b0;
+        fw_hi = 1'b0;
+        fw_a = c_vd;
+        fw_d = 64'b0;
+        case (state)
+            S_SFP: if (!sf_is_div && c_kind != VK_SFPX && ph == PH_WR) begin
+                fw_lo = 1'b1;
+                fw_hi = 1'b1;
+                fw_d = mcz_wd;
+            end
+            S_SFDIV: if (c_dbl ? fds64_done : fds32_done) begin
+                fw_lo = 1'b1;
+                fw_hi = 1'b1;
+                fw_d = c_dbl ? fds64_res : {32'hFFFFFFFF, fds32_res};
+            end
+            S_MEM: if (c_is_sfp_mem && c_load && mem_busy_req && mem_rvalid && !mem_load_pf) begin
+                // flw: whole register (boxed); fld: low word, then high word
+                fw_lo = !c_dbl || !e[0];
+                fw_hi = !c_dbl || e[0];
+                fw_d = c_dbl ? {mem_rdata, mem_rdata} : {32'hFFFFFFFF, mem_rdata};
+            end
+            S_DONE: if (c_kind == VK_XUNARY && c_funct3 == F3_OPFVV) begin
+                fw_lo = 1'b1;
+                fw_hi = 1'b1;
+                fw_d = {32'hFFFFFFFF, a_elem};                                                 // vfmv.f.s
+            end
+            default: ;
+        endcase
+    end
+
+    // Scalar FP results, captured at the end of ph 4 and used in ph 5
+    reg [63:0] sfp_wd;
+    reg [31:0] sfp_resp;
+    reg [4:0]  sfp_fl;
+    always @(*) begin
+        if (sfn == 5'b11110 && sop == 7'b1010011) sfp_wd = {32'hFFFFFFFF, c_rs1};               // fmv.w.x
+        else if (sop == 7'b1010011 && sfn == 5'b01000)
+            sfp_wd = c_dbl ? fd_res : {32'hFFFFFFFF, fd_res[31:0]};                            // cvt.d.s / cvt.s.d
+        else if (c_dbl) sfp_wd = fd_res;
+        else sfp_wd = {32'hFFFFFFFF, fp_res};
+        if (sfn == 5'b11100 && c_instr[14:12] == 3'd0) sfp_resp = mcx_s1[31:0];                 // fmv.x.w
+        else sfp_resp = c_dbl ? fd_res[31:0] : (sfn == 5'b10100) ? {31'b0, fp_bit} : fp_res;
+        if (c_kind == VK_SFPX) sfp_fl = c_dbl ? fd_flags : fp_flags;
+        else if (sfn == 5'b11110 && sop == 7'b1010011) sfp_fl = 5'b0;                           // fmv.w.x
+        else if ((sop == 7'b1010011 && sfn == 5'b01000) || c_dbl) sfp_fl = fd_flags;
+        else sfp_fl = fp_flags;
+    end
+    always @(posedge clk) begin
+        if (state == S_SFP && ph == PH_CAP) begin
+            mcz_wd <= sfp_wd;
+            mcz_resp <= sfp_resp;
+            mcz_fl <= sfp_fl;
         end
     end
 
     // Combinational per-cycle decisions
     reg        step_done;      // this element is finished this cycle
-    always @(*) fdiv_start = (state == S_RUN) && fdiv_op && mask_on;
-    always @(*) sf_div_start = (state == S_SFP) && sf_is_div;
+    always @(*) fdiv_start = (state == S_RUN) && (ph == PH_WR) && fdiv_op && mask_on;
+    always @(*) sf_div_start = (state == S_SFP) && (ph == PH_FETCH) && sf_is_div;
     reg        last_elem;
     reg [31:0] sel_val;
 
@@ -927,7 +1095,7 @@ module vpu_top #(
                         if (mask_on) put_elem(c_vs1[0] ? sx(a_raw, c_eew_s2) : zx(a_raw, c_eew_s2));
                     end else if (div_op || fdiv_op) begin
                         if (mask_on) begin
-                            div_req = div_op;
+                            div_req = div_op && (ph == PH_WR);
                             step_done = 1'b0;    // S_DIV finishes it
                         end
                     end else if (c_funct6 == 6'b010111 || c_funct6 == 6'b010000 || c_funct6 == 6'b010010) begin
@@ -947,45 +1115,47 @@ module vpu_top #(
                 end
                 VK_MASKLOGIC: begin
                     case (c_funct6[2:0])
-                        3'b000: put_bit(vA[e[8:0]] & ~vB[e[8:0]]);   // vmandn
-                        3'b001: put_bit(vA[e[8:0]] & vB[e[8:0]]);    // vmand
-                        3'b010: put_bit(vA[e[8:0]] | vB[e[8:0]]);    // vmor
-                        3'b011: put_bit(vA[e[8:0]] ^ vB[e[8:0]]);    // vmxor
-                        3'b100: put_bit(vA[e[8:0]] | ~vB[e[8:0]]);   // vmorn
-                        3'b101: put_bit(~(vA[e[8:0]] & vB[e[8:0]])); // vmnand
-                        3'b110: put_bit(~(vA[e[8:0]] | vB[e[8:0]])); // vmnor
-                        default: put_bit(~(vA[e[8:0]] ^ vB[e[8:0]]));// vmxnor
+                        3'b000: put_bit(mcx_ma & ~mcx_mb);   // vmandn
+                        3'b001: put_bit(mcx_ma & mcx_mb);    // vmand
+                        3'b010: put_bit(mcx_ma | mcx_mb);    // vmor
+                        3'b011: put_bit(mcx_ma ^ mcx_mb);    // vmxor
+                        3'b100: put_bit(mcx_ma | ~mcx_mb);   // vmorn
+                        3'b101: put_bit(~(mcx_ma & mcx_mb)); // vmnand
+                        3'b110: put_bit(~(mcx_ma | mcx_mb)); // vmnor
+                        default: put_bit(~(mcx_ma ^ mcx_mb));// vmxnor
                     endcase
                 end
                 VK_RED, VK_WRED: begin
-                    // acc already holds vs1[0]; fold active elements, write vd[0] at the end
-                    if (last_elem) put_elem(red_next);
+                    // acc already holds vs1[0]; fold active elements, write vd[0] at the end.
+                    // vfredusum with no active element and a NaN vs1[0] gives the canonical
+                    // NaN (NV if it was signaling), as Spike does.
+                    if (last_elem) put_elem(red_none_nan ? 32'h7FC00000 : red_next);
                 end
                 VK_SLIDEUP: begin
                     if (c_funct6 == 6'b001110 && (c_funct3 == F3_OPMVX || c_funct3 == F3_OPFVF)) begin
-                        if (mask_on) put_elem((e == 10'd0) ? c_rs1 : a_elem);
+                        if (mask_on) put_elem((e == 10'd0) ? c_rs1 : a_raw);
                     end else if (e >= slide_off && mask_on) begin
-                        put_elem(a_elem);
+                        put_elem(a_raw);
                     end
                 end
                 VK_SLIDEDOWN: begin
                     if (c_funct6 == 6'b001111 && (c_funct3 == F3_OPMVX || c_funct3 == F3_OPFVF)) begin
-                        if (mask_on) put_elem((e + 10'd1 == evl) ? c_rs1 : a_elem);
+                        if (mask_on) put_elem((e + 10'd1 == evl) ? c_rs1 : a_raw);
                     end else if (mask_on) begin
                         put_elem(({1'b0, e} + {1'b0, slide_off} < {1'b0, c_vlmax} && slide_amt < 32'd1024) ?
-                                 a_elem : 32'b0);
+                                 a_raw : 32'b0);
                     end
                 end
                 VK_GATHER, VK_GATHER16: begin
                     if (mask_on) begin
                         sel_val = is_vv ? zx(b_vec, c_eew_s1) : is_vi ? uimm : c_rs1;
-                        put_elem((sel_val < {22'b0, c_vlmax}) ? a_elem : 32'b0);
+                        put_elem((sel_val < {22'b0, c_vlmax}) ? a_raw : 32'b0);
                     end
                 end
                 VK_COMPRESS: begin
-                    if (vB[e[8:0]]) put_elem(a_raw);
+                    if (mcx_mb) put_elem(a_raw);
                 end
-                VK_VMVNR: put_elem(a_elem);
+                VK_VMVNR: put_elem(a_raw);
                 VK_XUNARY: ;    // result computed below, no writes
                 VK_SUNARY: begin
                     if (evl != 10'd0) put_elem(c_rs1);
@@ -993,9 +1163,9 @@ module vpu_top #(
                 VK_MSETBIT: begin
                     if (mask_on) begin
                         case (c_vs1[1:0])
-                            2'd1: put_bit(!found && !vA[e[8:0]]);                 // vmsbf
+                            2'd1: put_bit(!found && !mcx_ma);                 // vmsbf
                             2'd3: put_bit(!found);                                      // vmsif
-                            default: put_bit(!found && vA[e[8:0]]);               // vmsof
+                            default: put_bit(!found && mcx_ma);               // vmsof
                         endcase
                     end
                 end
@@ -1024,7 +1194,6 @@ module vpu_top #(
     end
 
     // Reduction fold value (acc op active element)
-    reg [31:0] red_next;
     always @(*) begin
         red_next = acc;
         if (c_kind == VK_RED && (c_funct3 == F3_OPFVV)) begin
@@ -1074,7 +1243,8 @@ module vpu_top #(
             fflags_set <= 5'b0;
             f_beat <= 5'd0;
             f_last <= 5'd0;
-            f_drain <= 2'd0;
+            f_drain <= 3'd0;
+            ph <= PH_FETCH;
             c_instr <= 32'b0;
             c_rs1 <= 32'b0;
             c_rs2 <= 32'b0;
@@ -1104,7 +1274,7 @@ module vpu_top #(
                     c_instr <= h_instr;
                     // .vf forms take f[rs1] (NaN-unboxed); everything else the x value
                     c_rs1 <= (h_instr[6:0] == 7'b1010111 && h_instr[14:12] == F3_OPFVF) ?
-                             unbox(freg[h_instr[19:15]]) : q_rs1[q_head];
+                             unbox(sf1) : q_rs1[q_head];
                     c_rs2 <= q_rs2[q_head];
                     c_vl <= q_vl[q_head];
                     c_vtype <= h_vtype;
@@ -1123,6 +1293,7 @@ module vpu_top #(
                     fld <= 3'd0;
                     found <= 1'b0;
                     fault_hit <= 1'b0;
+                    ph <= PH_FETCH;
                     // Reductions start from vs1[0] (2*SEW for widening reductions)
                     acc <= (dec_kind == VK_RED || dec_kind == VK_WRED) ? b_elem : 32'd0;
                     if (dec_kind == VK_SFP || dec_kind == VK_SFPX) begin
@@ -1140,20 +1311,27 @@ module vpu_top #(
                     end
                 end
 
-                S_RUN: begin
+                S_RUN: if (ph == PH_FETCH) begin
+                    ph <= (c_kind == VK_GATHER || c_kind == VK_GATHER16) ? PH_FETCH2 : 3'd2;
+                end else if (ph != PH_WR) begin
+                    ph <= ph + 3'd1;
+                end else begin
+                    ph <= PH_FETCH;
                     if ((c_funct3 == F3_OPFVV || c_funct3 == F3_OPFVF) && !fdiv_op && mask_on &&
                         c_kind != VK_SLIDEUP && c_kind != VK_SLIDEDOWN && c_kind != VK_XUNARY &&
                         c_kind != VK_SUNARY && c_funct6 != 6'b010111)
-                        fflags_set <= fp_flags;
-                    if (r_sat && mask_on && (c_kind == VK_ELEM || c_kind == VK_NARROW)) vxsat_set <= 1'b1;
-                    if (c_kind == VK_RED || c_kind == VK_WRED) acc <= red_next;
-                    if (c_kind == VK_COMPRESS && vB[e[8:0]]) acc <= acc + 32'd1;
-                    if (c_kind == VK_IOTA && mask_on && vA[e[8:0]]) acc <= acc + 32'd1;
-                    if (c_kind == VK_XUNARY && mask_on && vA[e[8:0]]) begin
+                        fflags_set <= mcy_fl;
+                    if (mcy_sat && mask_on && (c_kind == VK_ELEM || c_kind == VK_NARROW)) vxsat_set <= 1'b1;
+                    if (c_kind == VK_RED || c_kind == VK_WRED) acc <= mcy_red;
+                    if (c_kind == VK_RED && mask_on) found <= 1'b1;
+                    if (red_none_nan && last_elem && !acc[22]) fflags_set <= 5'b10000;
+                    if (c_kind == VK_COMPRESS && mcx_mb) acc <= acc + 32'd1;
+                    if (c_kind == VK_IOTA && mask_on && mcx_ma) acc <= acc + 32'd1;
+                    if (c_kind == VK_XUNARY && mask_on && mcx_ma) begin
                         if (c_vs1 == 5'd16) acc <= acc + 32'd1;                     // vcpop
                         else if (!found) begin acc <= {22'b0, e}; found <= 1'b1; end // vfirst
                     end
-                    if (c_kind == VK_MSETBIT && mask_on && vA[e[8:0]]) found <= 1'b1;
+                    if (c_kind == VK_MSETBIT && mask_on && mcx_ma) found <= 1'b1;
                     if (fdiv_op && mask_on) begin
                         state <= S_DIV;
                     end else if (div_req && !step_done) begin
@@ -1168,32 +1346,19 @@ module vpu_top #(
                 S_SFP: begin
                     if (sf_is_div) begin
                         state <= S_SFDIV;
+                    end else if (ph != PH_WR) begin
+                        ph <= ph + 3'd1;
                     end else begin
-                        // one-cycle ops: write f[rd] or answer with an x value
-                        if (c_kind == VK_SFPX) begin
-                            if (sfn == 5'b11100 && c_instr[14:12] == 3'd0) resp_data <= sf1[31:0];   // fmv.x.w
-                            else resp_data <= c_dbl ? fd_res[31:0] :
-                                              (sfn == 5'b10100) ? {31'b0, fp_bit} : fp_res;
-                            fflags_set <= c_dbl ? fd_flags : fp_flags;
-                        end else if (sfn == 5'b11110 && sop == 7'b1010011) begin
-                            freg[c_vd] <= {32'hFFFFFFFF, c_rs1};                                       // fmv.w.x
-                        end else if (sop == 7'b1010011 && sfn == 5'b01000) begin
-                            freg[c_vd] <= c_dbl ? fd_res : {32'hFFFFFFFF, fd_res[31:0]};               // cvt.d.s / cvt.s.d
-                            fflags_set <= fd_flags;
-                        end else if (c_dbl) begin
-                            freg[c_vd] <= fd_res;
-                            fflags_set <= fd_flags;
-                        end else begin
-                            freg[c_vd] <= {32'hFFFFFFFF, fp_res};
-                            fflags_set <= fp_flags;
-                        end
+                        // write f[rd] (port below) or answer with an x value
+                        ph <= PH_FETCH;
+                        if (c_kind == VK_SFPX) resp_data <= mcz_resp;
+                        fflags_set <= mcz_fl;
                         state <= S_DONE;
                     end
                 end
 
                 S_SFDIV: begin
                     if (c_dbl ? fds64_done : fds32_done) begin
-                        freg[c_vd] <= c_dbl ? fds64_res : {32'hFFFFFFFF, fds32_res};
                         fflags_set <= c_dbl ? fds64_fl : fds32_fl;
                         state <= S_DONE;
                     end
@@ -1201,14 +1366,14 @@ module vpu_top #(
 
                 S_FAST: begin
                     if (f_beat == f_last) begin
-                        f_drain <= 2'd2;
+                        f_drain <= 3'd4;   // lane pipeline depth
                         state <= S_DRAIN;
                     end else f_beat <= f_beat + 5'd1;
                 end
 
                 S_DRAIN: begin
-                    if (f_drain == 2'd0) state <= S_DONE;
-                    else f_drain <= f_drain - 2'd1;
+                    if (f_drain == 3'd0) state <= S_DONE;
+                    else f_drain <= f_drain - 3'd1;
                 end
 
                 S_DIV: if (fdiv_op ? fdiv_done : div_ready) begin
@@ -1257,11 +1422,6 @@ module vpu_top #(
                             state <= S_DONE;
                         end
                     end else if (mem_rvalid) begin
-                        if (c_is_sfp_mem && c_load) begin
-                            if (!c_dbl) freg[c_vd] <= {32'hFFFFFFFF, mem_rdata};
-                            else if (e[0]) freg[c_vd][63:32] <= mem_rdata;
-                            else freg[c_vd][31:0] <= mem_rdata;
-                        end
                         if (mem_chain) begin
                             // next access goes out at once
                             mem_addr <= elem_addr;
@@ -1283,8 +1443,6 @@ module vpu_top #(
                 S_DONE: begin
                     q_pop <= 1'b1;
                     state <= S_IDLE;
-                    if (c_kind == VK_XUNARY && c_funct3 == F3_OPFVV)
-                        freg[c_vd] <= {32'hFFFFFFFF, a_elem};          // vfmv.f.s
                     if (c_scalar || c_load || c_store) begin
                         resp_valid <= 1'b1;
                         resp_fault <= fault_hit;
@@ -1302,3 +1460,6 @@ module vpu_top #(
     end
 
 endmodule
+
+// Restore the default so this file's setting cannot leak into the next one compiled.
+`default_nettype wire

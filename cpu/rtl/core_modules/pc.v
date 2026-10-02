@@ -1,12 +1,12 @@
 `include "memory_map.vh"
 module pc(
-   input clk,
-   input rst,
-   input j_signal,
-   input stall,         // Added stall input
-   input [31:0] jump,
-   output[31:0] out,
-   output[31:0] next_out  // PC for the next cycle, so a synchronous I-cache can index early
+   input wire clk,
+   input wire rst,
+   input wire j_signal,
+   input wire stall,         // Added stall input
+   input wire [31:0] jump,
+   output wire [31:0] out,
+   output wire [31:0] next_out  // PC for the next cycle, so a synchronous I-cache can index early
 );
    reg [31:0] next_pc = `INSTR_MEM_BASE;
 

@@ -23,6 +23,13 @@ linux: obj_linux/Vsoc_sim_top
 run: obj/Vsoc_sim_top
 	./obj/Vsoc_sim_top +hex=$(HEX) +tohost=$(TOHOST)
 
+# Boot Synapse Linux (Buildroot output) on the 256 MB model; the console is the UART echo.
+#   make boot-linux [IMG=~/opt/br-synapse32/images/synapse.hex] [CYCLES=2000000000]
+IMG    ?= $(HOME)/opt/br-synapse32/images/synapse.hex
+CYCLES ?= 2000000000
+boot-linux: obj_linux/Vsoc_sim_top
+	./obj_linux/Vsoc_sim_top +hex=$(IMG) +tohost=0 +max_cycles=$(CYCLES)
+
 clean:
 	rm -rf obj obj_linux
-.PHONY: run clean linux
+.PHONY: run clean linux boot-linux

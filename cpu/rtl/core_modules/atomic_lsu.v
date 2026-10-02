@@ -1,5 +1,4 @@
 `default_nettype none
-`include "instr_defines.vh"
 
 module atomic_lsu (
     input wire clk,
@@ -22,6 +21,7 @@ module atomic_lsu (
     output wire [31:0] sc_result,
     output reg [31:0] atomic_new_word
 );
+`include "instr_defines.vh"
 
     reg lr_valid;
     reg [31:0] lr_addr;
@@ -109,3 +109,6 @@ module atomic_lsu (
     end
 
 endmodule
+
+// Restore the default so this file's setting cannot leak into the next one compiled.
+`default_nettype wire

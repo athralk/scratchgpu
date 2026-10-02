@@ -1,5 +1,4 @@
 `default_nettype none
-`include "instr_defines.vh"
 module execution_unit(
     input wire [31:0] rs1,
     input wire [31:0] rs2,
@@ -39,8 +38,8 @@ module execution_unit(
     output reg jump_signal,
     output reg [31:0] jump_addr,
     output reg [31:0] mem_addr,
-    output reg [31:0] rs1_value_out,
-    output reg [31:0] rs2_value_out,
+    output wire [31:0] rs1_value_out,
+    output wire [31:0] rs2_value_out,
     output reg flush_pipeline,
     
     // Add interrupt/exception inputs
@@ -80,6 +79,7 @@ module execution_unit(
     // An execute trigger fires before the instruction, so it wins over its fetch page fault.
     output wire execute_trigger_hit
 );
+`include "instr_defines.vh"
 
 // Internal signals for forwarded values
 reg [31:0] rs1_value;
@@ -660,3 +660,6 @@ always @(*) begin
 end
 
 endmodule
+
+// Restore the default so this file's setting cannot leak into the next one compiled.
+`default_nettype wire

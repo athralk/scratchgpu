@@ -28,7 +28,7 @@ def run_one(seed, args, work):
     d.mkdir(parents=True, exist_ok=True)
     src, elf = d / "t.S", d / "t.elf"
     sh([sys.executable, str(HERE / "vgen.py"), "--seed", str(seed), "--out", str(src),
-        "--classes", args.classes, "--blocks", str(args.blocks), "--ops", str(args.ops)])
+        "--classes", args.classes, "--blocks", str(args.blocks), "--ops", str(args.ops)] + (["--irq"] if args.irq else []))
     r = sh(["riscv64-unknown-elf-gcc", f"-march={MARCH}", "-mabi=ilp32", "-nostdlib",
             "-T", str(LINK), str(src), "-o", str(elf)])
     if r.returncode:
@@ -80,6 +80,7 @@ def main():
     ap.add_argument("--ops", type=int, default=6)
     ap.add_argument("--jobs", type=int, default=12)
     ap.add_argument("--keep", action="store_true")
+    ap.add_argument("--irq", action="store_true", help="random timer interrupts during the test")
     ap.add_argument("--work", default=None)
     a = ap.parse_args()
     lo, _, hi = a.seeds.partition("-")

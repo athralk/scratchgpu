@@ -247,3 +247,6 @@ module axi_mem_master #(
     end
 
 endmodule
+
+// Restore the default so this file's setting cannot leak into the next one compiled.
+`default_nettype wire

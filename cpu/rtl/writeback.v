@@ -1,6 +1,5 @@
 // Module for the write-back stage to select correct data to write to register file
 `default_nettype none
-`include "instr_defines.vh"
 module writeback (
     input wire rd_valid_in,
     input wire [4:0] rd_addr_in,
@@ -11,6 +10,7 @@ module writeback (
     output wire [31:0] rd_value_out,
     output wire wr_en_out
 );
+`include "instr_defines.vh"
     wire is_load_instr;
     assign is_load_instr = (instr_id_in == INSTR_LB) || 
                            (instr_id_in == INSTR_LH) || 
@@ -35,3 +35,6 @@ module writeback (
     assign wr_en_out = rd_valid_in;
     
 endmodule
+
+// Restore the default so this file's setting cannot leak into the next one compiled.
+`default_nettype wire

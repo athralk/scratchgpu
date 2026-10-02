@@ -127,9 +127,10 @@ module soc_sim_top #(
     always @(posedge clk) begin
         if (fptrace_on && !rst) begin
             if (soc.vpu.state != 0)
-                $display("t=%0t vpu st=%0d kind=%0d instr=%h fflags_set=%b fp_flags=%b sf1=%h sf2=%h fp_res=%h",
-                         $time, soc.vpu.state, soc.vpu.c_kind, soc.vpu.c_instr, soc.vpu.fflags_set,
-                         soc.vpu.fp_flags, soc.vpu.sf1, soc.vpu.sf2, soc.vpu.fp_res);
+                $display("t=%0t vpu st=%0d ph=%0d e=%0d kind=%0d instr=%h fflags_set=%b fp_flags=%b a=%h b=%h acc=%h fp_res=%h m=%b red=%h",
+                         $time, soc.vpu.state, soc.vpu.ph, soc.vpu.e, soc.vpu.c_kind, soc.vpu.c_instr, soc.vpu.fflags_set,
+                         soc.vpu.fp_flags, soc.vpu.mcx_a, soc.vpu.mcx_b, soc.vpu.acc, soc.vpu.fp_res, soc.vpu.mask_on,
+                         soc.vpu.red_next);
             if (soc.cpu_inst.id_ex_inst0_instr_out == 32'h001015f3)
                 $display("t=%0t fsflags in EX: fflags=%b vcsr_stall=%b busy=%b memwait=%b rd_data=%h", $time,
                          soc.cpu_inst.csr_file_inst.fflags, soc.cpu_inst.vcsr_stall, soc.vec_busy,

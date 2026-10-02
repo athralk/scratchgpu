@@ -40,3 +40,6 @@ module vpu_vrf (
                 if (wen[k]) v0[32*k +: 32] <= wdata[32*k +: 32];
     end
 endmodule
+
+// Restore the default so this file's setting cannot leak into the next one compiled.
+`default_nettype wire

@@ -14,6 +14,9 @@ if [ -d "$repo/gpu/rtl" ]; then
     rsync -a --delete --include='*/' --include='*.v' --include='*.vh' --include='*.sv' --exclude='*' \
         "$repo/gpu/rtl/" "$dest/rtl/gpu/"
 fi
+# Timing constraints (multicycle paths of the vector unit)
+mkdir -p "$dest/constraints"
+cp "$repo/cpu/rtl/soc/soc_timing.xdc" "$dest/constraints/"
 # Board software: ARM bridge and the default Synapse image (the demo)
 mkdir -p "$dest/sw"
 [ -f "$repo/sw/arm_bridge/bridge.elf" ] && cp "$repo/sw/arm_bridge/bridge.elf" "$dest/sw/"

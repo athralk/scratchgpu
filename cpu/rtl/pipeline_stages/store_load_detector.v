@@ -1,5 +1,4 @@
 `default_nettype none
-`include "instr_defines.vh"
 module store_load_detector (
     // Current load instruction
     input wire [6:0] load_instr_id,
@@ -14,6 +13,7 @@ module store_load_detector (
     output wire store_load_hazard,
     output wire [31:0] forwarded_data
 );
+`include "instr_defines.vh"
     
     // Detect if current instruction is a load
     wire is_load = (load_instr_id == INSTR_LB) || (load_instr_id == INSTR_LH) || 
@@ -34,3 +34,6 @@ module store_load_detector (
     assign forwarded_data = store_load_hazard ? rs2_value : 32'b0;
     
 endmodule
+
+// Restore the default so this file's setting cannot leak into the next one compiled.
+`default_nettype wire

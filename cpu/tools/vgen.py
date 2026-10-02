@@ -13,11 +13,12 @@ import random
 import struct
 
 VLENB = 64
-CLASSES = ["int", "mask", "perm", "red", "widen", "mem", "fp", "sfp"]
+CLASSES = ["int", "mask", "perm", "red", "widen", "mem", "fp", "sfp", "smem"]
 
 
 class Gen:
-    def __init__(self, seed, classes, blocks, ops):
+    def __init__(self, seed, classes, blocks, ops, irq=False):
+        self.irq = irq
         self.r = random.Random(seed)
         self.classes = classes
         self.blocks = blocks
@@ -66,7 +67,12 @@ class Gen:
         self.emit(f"li {reg}, {v}")
 
     def store_scalar(self, reg):
-        self.emit(f"sw {reg}, {4 * self.nscalar}(s2)")
+        off = 4 * self.nscalar - getattr(self, "s2_base", 0)
+        if off > 2044:                       # keep within the 12-bit store immediate
+            self.emit("addi s2, s2, 2040")
+            self.s2_base = getattr(self, "s2_base", 0) + 2040
+            off -= 2040
+        self.emit(f"sw {reg}, {off}(s2)")
         self.nscalar += 1
 
     # ---------------- instruction pickers ----------------
@@ -394,6 +400,69 @@ class Gen:
         self.store_scalar("a2")
         self.emit("fsflags zero")
 
+    def gen_smem(self, sew, lm):
+        # Scalar memory stress: a 32 KB window (4x the D-cache), same-set aliases 4 KB apart,
+        # store->load pairs, all sizes, AMOs, byte copies like memcpy/gzip do.
+        r = self.r
+        self.emit("la s6, bigbuf")
+        for _ in range(24):
+            k = r.random()
+            set_off = r.randrange(0, 4096, 4)
+            way = r.randrange(8) * 4096           # 8 aliases of the same set
+            off = (set_off + way) % 32768
+            self.emit(f"li t5, {off}")
+            self.emit("add t5, s6, t5")
+            if k < 0.25:
+                op = r.choice(["sb", "sh", "sw"])
+                o = {"sb": r.randrange(4), "sh": r.choice([0, 2]), "sw": 0}[op]
+                self.rand_x("t6")
+                self.emit(f"{op} t6, {o}(t5)")
+                ld = r.choice(["lb", "lbu", "lh", "lhu", "lw"])
+                lo = {"lb": r.randrange(4), "lbu": r.randrange(4), "lh": r.choice([0, 2]),
+                      "lhu": r.choice([0, 2]), "lw": 0}[ld]
+                self.emit(f"{ld} a2, {lo}(t5)")       # store->load, often the same word
+                self.store_scalar("a2")
+            elif k < 0.45:
+                ld = r.choice(["lb", "lbu", "lh", "lhu", "lw"])
+                lo = {"lb": r.randrange(4), "lbu": r.randrange(4), "lh": r.choice([0, 2]),
+                      "lhu": r.choice([0, 2]), "lw": 0}[ld]
+                self.emit(f"{ld} a2, {lo}(t5)")
+                self.store_scalar("a2")
+            elif k < 0.6:
+                # byte copy loop (memcpy-like), 1..40 bytes between aliasing addresses
+                n = r.randint(1, 40)
+                d = (off + r.randrange(8) * 4096 + r.randrange(64)) % (32768 - 64)
+                self.emit(f"li t4, {d}")
+                self.emit("add t4, s6, t4")
+                self.emit(f"li t3, {n}")
+                self.emit("1: lbu t6, 0(t5)")
+                self.emit("sb t6, 0(t4)")
+                self.emit("addi t5, t5, 1")
+                self.emit("addi t4, t4, 1")
+                self.emit("addi t3, t3, -1")
+                self.emit("bnez t3, 1b")
+            elif k < 0.75:
+                self.rand_x("t6")
+                op = r.choice(["amoadd.w", "amoswap.w", "amoxor.w", "amomax.w", "amominu.w"])
+                self.emit(f"{op} a2, t6, (t5)")
+                self.store_scalar("a2")
+            elif k < 0.85:
+                # Retry loop: SC may fail spuriously (Spike drops reservations every 5000 instrs)
+                self.rand_x("t6")
+                self.emit("3: lr.w a2, (t5)")
+                self.emit("sc.w a3, t6, (t5)")
+                self.emit("bnez a3, 3b")
+                self.store_scalar("a2")
+            else:
+                # word fill (memset-like) over a few lines
+                n = r.randint(1, 24)
+                self.rand_x("t6")
+                self.emit(f"li t3, {n}")
+                self.emit("2: sw t6, 0(t5)")
+                self.emit("addi t5, t5, 4")
+                self.emit("addi t3, t3, -1")
+                self.emit("bnez t3, 2b")
+
     def gen_mem(self, sew, lm):
         r = self.r
         kind = r.choice(["unit", "unit", "strided", "indexed", "seg", "mask", "whole", "ff"])
@@ -500,7 +569,7 @@ class Gen:
         for _ in range(self.ops):
             getattr(self, {"int": "gen_int", "mask": "gen_mask", "perm": "gen_perm",
                            "red": "gen_red", "widen": "gen_widen", "mem": "gen_mem",
-                           "fp": "gen_fp", "sfp": "gen_sfp"}[cls])(sew, lm)
+                           "fp": "gen_fp", "sfp": "gen_sfp", "smem": "gen_smem"}[cls])(sew, lm)
         self.emit("csrr a2, vl")
         self.store_scalar("a2")
         self.emit("csrr a2, vxsat")
@@ -536,13 +605,46 @@ class Gen:
         self.emit("fsflags zero")
         self.emit("csrs mstatus, t0")
         self.emit("la s2, ssig")
+        if self.irq:
+            # Frequent machine timer interrupts. The handler leaves no architectural trace,
+            # so the signature must match Spike whatever instruction each interrupt lands on.
+            self.emit("la t0, irq_handler")
+            self.emit("csrw mtvec, t0")
+            self.emit("la t0, irq_area")
+            self.emit("csrw mscratch, t0")
+            self.emit("li t0, 0x2004000")
+            self.emit("li t1, 50")
+            self.emit("sw t1, 0(t0)")
+            self.emit("sw zero, 4(t0)")
+            self.emit("li t0, 0x80")
+            self.emit("csrs mie, t0")
+            self.emit("csrsi mstatus, 8")
         for bi in range(self.blocks):
             self.block(bi)
+        if self.irq:
+            self.emit("csrci mstatus, 8")
         self.emit("li t0, 1")
         self.emit("la t1, tohost")
         self.emit("sw t0, 0(t1)")
         self.emit("1: j 1b")
         out += self.lines
+        if self.irq:
+            out += [".align 4", "irq_handler:",
+                    "  csrrw t0, mscratch, t0",        # t0 = save area
+                    "  sw t1, 4(t0)", "  sw t2, 8(t0)",
+                    "  csrr t1, mscratch", "  sw t1, 0(t0)",
+                    "  csrr t1, mcause", "  bgez t1, irq_bad",
+                    "  lw t1, 12(t0)",                  # xorshift32 interval
+                    "  slli t2, t1, 13", "  xor t1, t1, t2", "  srli t2, t1, 17", "  xor t1, t1, t2",
+                    "  slli t2, t1, 5", "  xor t1, t1, t2", "  sw t1, 12(t0)",
+                    "  andi t1, t1, 255", "  addi t1, t1, 20",
+                    "  li t2, 0x200BFF8", "  lw t2, 0(t2)", "  add t1, t1, t2",
+                    "  li t2, 0x2004000", "  sw t1, 0(t2)", "  sw zero, 4(t2)",
+                    "  lw t1, 16(t0)", "  addi t1, t1, 1", "  sw t1, 16(t0)",
+                    "  csrw mscratch, t0",
+                    "  lw t1, 4(t0)", "  lw t2, 8(t0)", "  lw t0, 0(t0)",
+                    "  mret",
+                    "irq_bad:", "  li t1, 3", "  la t2, tohost", "  sw t1, 0(t2)", "2: j 2b"]
 
         def fp_word():
             k = r.random()
@@ -560,9 +662,11 @@ class Gen:
         out += [".section .tohost,\"aw\",@progbits", ".align 6", ".globl tohost", "tohost: .dword 0",
                 ".globl fromhost", "fromhost: .dword 0", ".data", ".align 6", "vdata:"]
         out += [f"  .word 0x{w:08x}" for w in data]
+        out += [".align 4", "irq_area: .word 0, 0, 0, 0x%08x, 0" % (r.getrandbits(31) | 1)]
         out += [".align 6", "scratch:"] + [f"  .word 0x{r.getrandbits(32):08x}" for _ in range(4096)]
         out += [".align 6", ".globl begin_signature", "begin_signature:",
                 "ssig: .fill 2048, 4, 0",
+                "bigbuf:"] + [f"  .word 0x{r.getrandbits(32):08x}" for _ in range(8192)] + [
                 f"vsig: .fill {self.blocks * 512}, 4, 0",
                 f"msig: .fill {self.blocks * 512}, 4, 0",
                 ".globl end_signature", "end_signature:"]
@@ -576,8 +680,9 @@ def main():
     ap.add_argument("--classes", default=",".join(CLASSES))
     ap.add_argument("--blocks", type=int, default=12)
     ap.add_argument("--ops", type=int, default=6)
+    ap.add_argument("--irq", action="store_true")
     a = ap.parse_args()
-    g = Gen(a.seed, a.classes.split(","), a.blocks, a.ops)
+    g = Gen(a.seed, a.classes.split(","), a.blocks, a.ops, a.irq)
     with open(a.out, "w") as f:
         f.write(g.program())
 

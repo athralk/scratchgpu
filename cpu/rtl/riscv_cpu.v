@@ -1,6 +1,5 @@
 `default_nettype none
 `include "memory_map.vh"
-`include "instr_defines.vh"
 module riscv_cpu (
     input wire clk,
     input wire rst,
@@ -69,6 +68,7 @@ module riscv_cpu (
     input wire software_interrupt,
     input wire external_interrupt
 );
+`include "instr_defines.vh"
 
     // Instantiate PC
     wire [31:0] pc_inst0_out;
@@ -1165,3 +1165,6 @@ module riscv_cpu (
     // Write Back Stage
 
 endmodule
+
+// Restore the default so this file's setting cannot leak into the next one compiled.
+`default_nettype wire

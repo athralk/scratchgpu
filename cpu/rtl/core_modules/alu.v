@@ -1,5 +1,4 @@
 `default_nettype none
-`include "instr_defines.vh"
 module alu (
     input wire [31:0] rs1,
     input wire [31:0] rs2,
@@ -8,6 +7,7 @@ module alu (
     input wire [31:0] pc_input,
     output reg [31:0] ALUoutput
 );
+`include "instr_defines.vh"
 
 wire signed [31:0] rs1_signed = $signed(rs1);
 wire signed [31:0] rs2_signed = $signed(rs2);
@@ -57,3 +57,6 @@ wire signed [31:0] rs2_signed = $signed(rs2);
     end
 `endif
 endmodule
+
+// Restore the default so this file's setting cannot leak into the next one compiled.
+`default_nettype wire

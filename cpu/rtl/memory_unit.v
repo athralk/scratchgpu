@@ -1,5 +1,4 @@
 `default_nettype none
-`include "instr_defines.vh"
 module memory_unit (
     input wire [6:0] instr_id,
     input wire [31:0] rs2_value,
@@ -12,6 +11,7 @@ module memory_unit (
     output wire [3:0] write_byte_enable,  // For store operations
     output wire [2:0] load_type           // For load operations
 );
+`include "instr_defines.vh"
 
 // Based on the instruction ID, set the wr_enable and read_enable signals
 assign read_enable = (instr_id == INSTR_LB) || (instr_id == INSTR_LH) || (instr_id == INSTR_LW) || (instr_id == INSTR_LBU) || (instr_id == INSTR_LHU) ? 1'b1 : 1'b0;
@@ -46,3 +46,6 @@ assign wr_data =
     32'b0;
 
 endmodule
+
+// Restore the default so this file's setting cannot leak into the next one compiled.
+`default_nettype wire

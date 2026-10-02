@@ -520,7 +520,7 @@ module vpu_fp32 (
     reg         use_fma;
     wire [31:0] fma_res;
     wire [4:0]  fma_flags;
-    fp32_fma fma_u (.a(fx), .b(fy), .c(fz), .rm(rm), .mul(funct6 == 6'b100100),
+    fp32_fma fma_u (.clk(1'b0), .a(fx), .b(fy), .c(fz), .rm(rm), .mul(funct6 == 6'b100100),
                      .result(fma_res), .flags(fma_flags));
     always @(*) begin
         use_fma = 1'b1;
@@ -813,3 +813,6 @@ module fp32_divsqrt (
     end
 
 endmodule
+
+// Restore the default so this file's setting cannot leak into the next one compiled.
+`default_nettype wire
