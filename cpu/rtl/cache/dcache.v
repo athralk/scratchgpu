@@ -22,7 +22,12 @@ module dcache (
     input  wire [3:0]  be,              // relative to vaddr
     input  wire [2:0]  load_type,
     input  wire        lookup_valid,    // translation ready, no fault
-    input  wire [19:0] ppn,
+    input  wire [19:0] ppn,             // physical page (refill address, tag write, store buffer)
+    // The hit check compares the tags with every candidate page in parallel and then picks the
+    // matching one, so it does not wait for the translation's page mux (cand_match: at most
+    // one page value among the set bits; duplicates carry the same page).
+    input  wire [4*20-1:0] cand_ppn,
+    input  wire [3:0]  cand_match,
     input  wire        cacheable,
     output wire        rvalid,
     output reg  [31:0] rdata,
@@ -97,8 +102,16 @@ module dcache (
 
     // ---------------- Lookup ----------------
     wire [6:0] cur_set = vaddr[11:5];
-    wire hit0 = valid0_q && (tag0_q == ppn);
-    wire hit1 = valid1_q && (tag1_q == ppn);
+    reg [3:0] tag0_eq, tag1_eq;
+    integer ci;
+    always @(*) begin
+        for (ci = 0; ci < 4; ci = ci + 1) begin
+            tag0_eq[ci] = (tag0_q == cand_ppn[20*ci +: 20]);
+            tag1_eq[ci] = (tag1_q == cand_ppn[20*ci +: 20]);
+        end
+    end
+    wire hit0 = valid0_q && |(cand_match & tag0_eq);
+    wire hit1 = valid1_q && |(cand_match & tag1_eq);
     wire line_hit = hit0 || hit1;
     wire hit_way = hit1;
 

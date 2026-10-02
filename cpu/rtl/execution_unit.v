@@ -119,6 +119,32 @@ function trigger_match;
     end
 endfunction
 
+// Trigger match on a data address a + b without forming the sum: a + b == c exactly when
+// a ^ b ^ c equals the carry each bit would receive, and that carry follows bitwise from a, b
+// and c (carry into bit i+1 = a&b | (a|b)&~c at bit i, given the sum bit equals c). This keeps
+// the 32-bit adder out of the trigger -> trap -> CSR-enable path.
+function sum_eq;
+    input [31:0] a, b, c;
+    reg [31:0] t;
+    begin
+        t = (a & b) | ((a | b) & ~c);
+        sum_eq = ((a ^ b ^ c) == {t[30:0], 1'b0});
+    end
+endfunction
+
+function trigger_match_sum;
+    input [3:0] enabled;
+    input [3:0] kind;
+    input [31:0] a, b;
+    input [127:0] tdata2;
+    begin
+        trigger_match_sum = (enabled[0] && kind[0] && sum_eq(a, b, tdata2[31:0])) ||
+                            (enabled[1] && kind[1] && sum_eq(a, b, tdata2[63:32])) ||
+                            (enabled[2] && kind[2] && sum_eq(a, b, tdata2[95:64])) ||
+                            (enabled[3] && kind[3] && sum_eq(a, b, tdata2[127:96]));
+    end
+endfunction
+
 function is_counter_shadow_csr;
     input [11:0] csr_addr_in;
     begin
@@ -165,13 +191,16 @@ wire [3:0] trigger_load = {trigger_control[21], trigger_control[14], trigger_con
 wire is_atomic_load = (instr_id == INSTR_LR_W);
 wire is_atomic_store = (instr_id == INSTR_SC_W);
 wire is_atomic_rmw = (opcode == 7'b0101111) && !is_atomic_load && !is_atomic_store;
-wire [31:0] trigger_data_addr = (opcode == 7'b0101111) ? rs1_value : (rs1_value + imm);
-assign execute_trigger_hit = stage_enable && instr_valid &&
+wire [31:0] trigger_data_off = (opcode == 7'b0101111) ? 32'b0 : imm;   // address = rs1 + this
+// The trap priority below uses the ungated match: everything it decides is gated by
+// stage_enable at the end, so the memory stage's wait signal enters only at that last step.
+wire execute_trigger_match = instr_valid &&
                              trigger_match(trigger_enabled, trigger_execute, pc_input, trigger_tdata2);
+assign execute_trigger_hit = stage_enable && execute_trigger_match;
 wire load_trigger_hit = instr_valid && (is_atomic_load || is_atomic_rmw) &&
-                        trigger_match(trigger_enabled, trigger_load, trigger_data_addr, trigger_tdata2);
+                        trigger_match_sum(trigger_enabled, trigger_load, rs1_value, trigger_data_off, trigger_tdata2);
 wire store_trigger_hit = instr_valid && (is_atomic_store || is_atomic_rmw) &&
-                         trigger_match(trigger_enabled, trigger_store, trigger_data_addr, trigger_tdata2);
+                         trigger_match_sum(trigger_enabled, trigger_store, rs1_value, trigger_data_off, trigger_tdata2);
 wire atomic_trigger_hit = load_trigger_hit || store_trigger_hit;
 
 // CSR-related signals
@@ -294,7 +323,7 @@ always @(*) begin
         flush_pipeline = 1;
         interrupt_taken = 1;
     // An execute trigger fires before the instruction, ahead of every exception it could raise.
-    end else if (execute_trigger_hit) begin
+    end else if (execute_trigger_match) begin
         jump_signal = 1;
         trap_to_supervisor = delegate_breakpoint;
         jump_addr = trap_to_supervisor ? stvec : mtvec;
@@ -319,7 +348,7 @@ always @(*) begin
             effective_addr = rs1_value + imm;
             mem_addr = effective_addr;
             // A load/store trigger fires before the access, so above misalignment and page faults.
-            if (trigger_match(trigger_enabled, trigger_load, effective_addr, trigger_tdata2)) begin
+            if (trigger_match_sum(trigger_enabled, trigger_load, rs1_value, imm, trigger_tdata2)) begin
                 jump_signal = 1;
                 trap_to_supervisor = delegate_breakpoint;
                 jump_addr = trap_to_supervisor ? stvec : mtvec;
@@ -338,7 +367,7 @@ always @(*) begin
             7'b0100011: begin // Store instructions
             effective_addr = rs1_value + imm;
             mem_addr = effective_addr;
-            if (trigger_match(trigger_enabled, trigger_store, effective_addr, trigger_tdata2)) begin
+            if (trigger_match_sum(trigger_enabled, trigger_store, rs1_value, imm, trigger_tdata2)) begin
                 jump_signal = 1;
                 trap_to_supervisor = delegate_breakpoint;
                 jump_addr = trap_to_supervisor ? stvec : mtvec;
@@ -657,6 +686,11 @@ always @(*) begin
     if (illegal_instruction_exception) begin
         exception_tval = instr;
     end
+
+    // The memory address does not depend on traps or interrupts: it also indexes the D-cache for
+    // the next cycle (module_data_addr_next_out), and every consumer in MEM checks the instruction
+    // kind, while a trapping instruction never reaches MEM (EX/MEM takes a bubble).
+    mem_addr = (opcode == 7'b0101111) ? rs1_value : (rs1_value + imm);
 end
 
 endmodule

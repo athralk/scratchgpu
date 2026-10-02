@@ -101,9 +101,16 @@ module soc_top #(
         else        rst_sync <= {rst_sync[0], 1'b0};
     end
     wire sys_rst = rst_sync[1];
+    // core_rst drives the asynchronous clear of every core and vector-unit flop (about 5k
+    // endpoints). One register cannot reach them all within a clock period, so it is
+    // replicated (max_fanout) after a first stage, and each copy serves a local group.
     wire ctrl_core_reset;
-    reg core_rst;
-    always @(posedge clk) core_rst <= sys_rst || ctrl_core_reset;
+    reg core_rst_pre;
+    (* max_fanout = 100 *) reg core_rst;
+    always @(posedge clk) begin
+        core_rst_pre <= sys_rst || ctrl_core_reset;
+        core_rst <= core_rst_pre;
+    end
 
     // ---------------- Core ----------------
     wire [31:0] pc, pc_next;
@@ -227,13 +234,24 @@ module soc_top #(
     wire [31:0] ptw_mem_addr, ptw_mem_rdata;
     wire ptw_d_req, ptw_i_req;
 
+    // ---------------- FENCE.I / SFENCE.VMA ----------------
+    // The core's pulses depend on the memory stage advancing (a long path), so they are
+    // registered and applied one cycle later. Fetch is held during that cycle so the refetch
+    // after the fence cannot use the old I-cache lines or translations.
+    reg fence_i_q, sfence_q;
+    always @(posedge clk) begin
+        fence_i_q <= !core_rst && fence_i;
+        sfence_q <= !core_rst && sfence_vma;
+    end
+    wire i_hold = fence_i_q || sfence_q;
+
     // ---------------- Instruction translation ----------------
     wire [19:0] i_vpn = pc[31:12];
     wire itlb_hit;
     wire [19:0] itlb_ppn;
     wire [7:0] itlb_flags;
     tlb #(.ENTRIES(8)) itlb (
-        .clk(clk), .rst(core_rst), .flush(sfence_vma),
+        .clk(clk), .rst(core_rst), .flush(sfence_q),
         .lookup_vpn(i_vpn), .hit(itlb_hit), .ppn(itlb_ppn), .pte_flags(itlb_flags),
         .fill(ptw_fill_i), .fill_vpn(ptw_vpn), .fill_pte(ptw_pte), .fill_mega(ptw_mega)
     );
@@ -248,53 +266,129 @@ module soc_top #(
     );
     wire i_walk_fault = ptw_fault_i && (ptw_vpn == i_vpn);
     wire [19:0] i_ppn = i_mmu_enable ? itlb_ppn : pc[31:12];
-    wire i_ready = !i_mmu_enable || (itlb_hit && !i_perm_fault);
-    assign ptw_i_req = i_mmu_enable && !itlb_hit && !i_walk_fault;
-    assign instr_page_fault = i_mmu_enable && ((itlb_hit && i_perm_fault) || i_walk_fault);
+    wire i_ready = !i_hold && (!i_mmu_enable || (itlb_hit && !i_perm_fault));
+    assign ptw_i_req = !i_hold && i_mmu_enable && !itlb_hit && !i_walk_fault;
+    assign instr_page_fault = !i_hold && i_mmu_enable && ((itlb_hit && i_perm_fault) || i_walk_fault);
 
     // ---------------- Data translation ----------------
+    // The memory stage sees a few registered translations (L0): the VPN, PPN, permission results
+    // and cacheability of recent pages, so the D-cache response depends on 20-bit compares
+    // instead of the TLB search, PPN mux and permission check. A miss costs one cycle:
+    // the D-TLB is searched with the registered VPN and L0 is filled (or the page walker is
+    // started). L0 is tagged with the translation context (MMU on, privilege, SUM, MXR), so any
+    // change of those misses it; SFENCE.VMA clears it.
     wire d_active = d_rd_en || d_wr_en;
     wire [31:0] d_vaddr = d_wr_en ? d_write_addr : d_read_addr;
     wire [19:0] d_vpn = d_vaddr[31:12];
     wire d_xlate = d_mmu_enable && d_active;
+    wire [4:0] d_ctx = {d_mmu_enable, d_priv, d_sum, d_mxr};
+
+    // L0 entries (4, round-robin), each with its permission results and cacheability
+    localparam L0N = 4;
+    reg [L0N-1:0] l0_valid;
+    reg [19:0]    l0_vpn [0:L0N-1];
+    reg [19:0]    l0_ppn [0:L0N-1];
+    reg [4:0]     l0_ctx [0:L0N-1];
+    reg [L0N-1:0] l0_ld_pf, l0_st_pf, l0_cacheable;
+    reg [1:0]     l0_victim;
+    // Both candidate addresses are compared in parallel; the read/write select comes last.
+    reg [L0N-1:0] l0_match;
+    // Kept as separate compares so synthesis does not move them behind the read/write select
+    // (the write enable arrives late).
+    (* keep = "true" *) wire [L0N-1:0] l0_eq_r, l0_eq_w;
+    genvar lg;
+    generate for (lg = 0; lg < L0N; lg = lg + 1) begin : g_l0eq
+        assign l0_eq_r[lg] = (l0_vpn[lg] == d_read_addr[31:12]);
+        assign l0_eq_w[lg] = (l0_vpn[lg] == d_write_addr[31:12]);
+    end endgenerate
+    reg [19:0]    l0_hit_ppn;
+    reg           l0_hit_ld_pf, l0_hit_st_pf, l0_hit_cacheable;
+    integer li;
+    always @(*) begin
+        l0_hit_ppn = 20'b0;
+        l0_hit_ld_pf = 1'b0;
+        l0_hit_st_pf = 1'b0;
+        l0_hit_cacheable = 1'b0;
+        for (li = 0; li < L0N; li = li + 1) begin
+            l0_match[li] = l0_valid[li] && (l0_ctx[li] == d_ctx) &&
+                           (d_wr_en ? l0_eq_w[li] : l0_eq_r[li]);
+            if (l0_match[li]) begin
+                l0_hit_ppn = l0_hit_ppn | l0_ppn[li];
+                l0_hit_ld_pf = l0_hit_ld_pf | l0_ld_pf[li];
+                l0_hit_st_pf = l0_hit_st_pf | l0_st_pf[li];
+                l0_hit_cacheable = l0_hit_cacheable | l0_cacheable[li];
+            end
+        end
+    end
+    wire l0_hit = |l0_match;
+    wire d_walk_fault = ptw_fault_d && (ptw_vpn == d_vpn) && d_xlate;
+
+    wire l0_fill;
+    // L0 miss: search the D-TLB next cycle with the registered page
+    reg        lk_valid;
+    reg [19:0] lk_vpn;
+    reg [4:0]  lk_ctx;
+    always @(posedge clk) begin
+        // A miss that is being filled this very cycle is not looked up again (no duplicate entries)
+        lk_valid <= !core_rst && !sfence_q && d_active && !l0_hit && !d_walk_fault &&
+                    !(l0_fill && lk_vpn == d_vpn && lk_ctx == d_ctx);
+        lk_vpn <= d_vpn;
+        lk_ctx <= d_ctx;
+    end
+    wire lk_mmu = lk_ctx[4];
     wire dtlb_hit;
     wire [19:0] dtlb_ppn;
     wire [7:0] dtlb_flags;
     tlb #(.ENTRIES(8)) dtlb (
-        .clk(clk), .rst(core_rst), .flush(sfence_vma),
-        .lookup_vpn(d_vpn), .hit(dtlb_hit), .ppn(dtlb_ppn), .pte_flags(dtlb_flags),
+        .clk(clk), .rst(core_rst), .flush(sfence_q),
+        .lookup_vpn(lk_vpn), .hit(dtlb_hit), .ppn(dtlb_ppn), .pte_flags(dtlb_flags),
         .fill(ptw_fill_d), .fill_vpn(ptw_vpn), .fill_pte(ptw_pte), .fill_mega(ptw_mega)
     );
-    wire d_perm_load_pf, d_perm_store_pf;
-    sv32_data_check d_check (
-        .translate_enable(d_xlate),
-        .addr_valid_in(dtlb_hit),
-        .privilege_mode(d_priv),
-        .sum(d_sum),
-        .mxr(d_mxr),
-        .data_rd_en(d_rd_en),
-        .data_wr_req(d_write_intent),
-        .leaf_pte({24'b0, dtlb_flags}),
-        .load_page_fault(d_perm_load_pf),
-        .store_page_fault(d_perm_store_pf),
-        .update_accessed(),
-        .update_dirty()
+    // Permission results for both access kinds, computed once when L0 is filled
+    wire fill_ld_pf, fill_st_pf;
+    sv32_data_check d_check_ld (
+        .translate_enable(1'b1), .addr_valid_in(1'b1),
+        .privilege_mode(lk_ctx[3:2]), .sum(lk_ctx[1]), .mxr(lk_ctx[0]),
+        .data_rd_en(1'b1), .data_wr_req(1'b0), .leaf_pte({24'b0, dtlb_flags}),
+        .load_page_fault(fill_ld_pf), .store_page_fault(), .update_accessed(), .update_dirty()
     );
-    wire d_walk_fault = ptw_fault_d && (ptw_vpn == d_vpn) && d_xlate;
-    wire d_perm_fault = dtlb_hit && (d_perm_load_pf || d_perm_store_pf);
-    assign d_load_pf = (d_xlate && dtlb_hit && d_perm_load_pf) ||
-                       (d_walk_fault && d_rd_en && !d_write_intent);
-    assign d_store_pf = (d_xlate && dtlb_hit && d_perm_store_pf) ||
-                        (d_walk_fault && d_write_intent);
-    wire [19:0] d_ppn = d_xlate ? dtlb_ppn : d_vpn;
-    wire d_ready = d_active && (!d_xlate || (dtlb_hit && !d_perm_fault));
-    assign ptw_d_req = d_xlate && !dtlb_hit && !d_walk_fault;
+    sv32_data_check d_check_st (
+        .translate_enable(1'b1), .addr_valid_in(1'b1),
+        .privilege_mode(lk_ctx[3:2]), .sum(lk_ctx[1]), .mxr(lk_ctx[0]),
+        .data_rd_en(1'b0), .data_wr_req(1'b1), .leaf_pte({24'b0, dtlb_flags}),
+        .load_page_fault(), .store_page_fault(fill_st_pf), .update_accessed(), .update_dirty()
+    );
+    wire [19:0] fill_ppn = lk_mmu ? dtlb_ppn : lk_vpn;
+    assign l0_fill = lk_valid && (!lk_mmu || dtlb_hit);
+    always @(posedge clk) begin
+        if (core_rst || sfence_q) begin
+            l0_valid <= {L0N{1'b0}};
+            l0_victim <= 2'd0;
+        end else if (l0_fill) begin
+            l0_valid[l0_victim] <= 1'b1;
+            l0_vpn[l0_victim] <= lk_vpn;
+            l0_ctx[l0_victim] <= lk_ctx;
+            l0_ppn[l0_victim] <= fill_ppn;
+            l0_ld_pf[l0_victim] <= lk_mmu && fill_ld_pf;
+            l0_st_pf[l0_victim] <= lk_mmu && fill_st_pf;
+            l0_cacheable[l0_victim] <= `IS_SOC_DRAM({fill_ppn, 12'h000});
+            l0_victim <= l0_victim + 2'd1;
+        end
+    end
+    assign ptw_d_req = lk_valid && lk_mmu && !dtlb_hit && !(ptw_fault_d && ptw_vpn == lk_vpn);
+
+    wire d_is_load = d_rd_en && !d_write_intent;
+    wire d_perm_fault = (d_is_load && l0_hit_ld_pf) || (d_write_intent && l0_hit_st_pf);
+    assign d_load_pf = (l0_hit && d_is_load && l0_hit_ld_pf) || (d_walk_fault && d_is_load);
+    assign d_store_pf = (l0_hit && d_write_intent && l0_hit_st_pf) || (d_walk_fault && d_write_intent);
+    wire [19:0] d_ppn = l0_hit_ppn;
+    wire d_ready = d_active && l0_hit && !d_perm_fault;
     wire [31:0] d_paddr = {d_ppn, d_vaddr[11:0]};
     wire [31:0] i_paddr = {i_ppn, pc[11:0]};
 
     ptw ptw_inst (
-        .clk(clk), .rst(core_rst), .flush(sfence_vma), .satp(satp),
-        .d_req(ptw_d_req), .d_vpn(d_vpn),
+        .clk(clk), .rst(core_rst), .flush(sfence_q), .satp(satp),
+        .d_req(ptw_d_req), .d_vpn(lk_vpn),
         .i_req(ptw_i_req), .i_vpn(i_vpn),
         .fill_d(ptw_fill_d), .fill_i(ptw_fill_i),
         .fault_d(ptw_fault_d), .fault_i(ptw_fault_i),
@@ -317,7 +411,7 @@ module soc_top #(
     reg  [31:0] io_rdata;
 
     icache icache_inst (
-        .clk(clk), .rst(core_rst), .invalidate(fence_i),
+        .clk(clk), .rst(core_rst), .invalidate(fence_i_q),
         .pc_next(pc_next), .pc(pc),
         .lookup_valid(i_ready), .cacheable(`IS_SOC_DRAM(i_paddr)), .ppn(i_ppn),
         .hit(instr_rvalid), .instr(instr),
@@ -329,7 +423,8 @@ module soc_top #(
         .clk(clk), .rst(core_rst),
         .req_rd(d_rd_en), .req_wr(d_wr_en), .vaddr(d_vaddr), .addr_next(d_addr_next),
         .wdata(d_wdata), .be(d_be), .load_type(d_load_type),
-        .lookup_valid(d_ready), .ppn(d_ppn), .cacheable(`IS_SOC_DRAM(d_paddr)),
+        .lookup_valid(d_ready), .ppn(d_ppn), .cacheable(l0_hit_cacheable),
+        .cand_ppn({l0_ppn[3], l0_ppn[2], l0_ppn[1], l0_ppn[0]}), .cand_match(l0_match),
         .rvalid(d_rvalid), .rdata(d_rdata),
         .inval_req(1'b0), .inval_addr(32'b0),
         .rf_req(drf_req), .rf_addr(drf_addr), .rf_gnt(drf_gnt),

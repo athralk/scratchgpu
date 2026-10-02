@@ -11,7 +11,10 @@
 // coherent with scalar code and translated with the same permissions. The CPU stays in
 // MEM until a load/store finishes; a fault reports the element index for vstart.
 module vpu_top #(
-    parameter LANES = 4           // SIMD lanes for the SEW=32 fast path (4, 8 or 16)
+    parameter LANES = 4,          // SIMD lanes for the SEW=32 fast path (4, 8 or 16)
+    // 1: divide / sqrt by reciprocal approximation (fp_rcpdiv: FP32 within 2 ulp, FP64 within
+    //    1 ulp, ~2x faster). 0: the exact, correctly rounded digit-recurrence fp_divsqrt.
+    parameter FAST_DIV = 1
 ) (
     input  wire        clk,
     input  wire        rst,
@@ -102,6 +105,13 @@ module vpu_top #(
     // Vector register file: 16 banks (one per 32-bit word), three whole-register read ports
     // ======================================================================
     reg  [4:0]   rA, rB, rD;          // read port register numbers
+    // Delayed divide / memory-result write (see "Write port"): it lands one cycle after the
+    // result, in the register captured with it, and port D reads that register for the merge.
+    reg  [4:0]   rD_elem;             // port D register of the current element (before that)
+    reg          ow_en_q;
+    reg  [4:0]   ow_reg_q;
+    reg  [8:0]   ow_word_q;
+    reg  [31:0]  ow_mask_q, ow_val_q;
     wire [511:0] vA, vB, vD;
     reg  [4:0]   w_reg;
     reg  [15:0]  w_en;
@@ -686,11 +696,19 @@ module vpu_top #(
     assign fds32_done = fdiv_done;
     assign fds32_res = fdiv_result;
     assign fds32_fl = fdiv_flags;
-    fp_divsqrt #(.EW(11), .MW(52)) sdiv64 (
-        .clk(clk), .rst(rst), .start(sf_div_start && c_dbl), .is_sqrt(sfn == 5'b01011),
-        .x(sf1), .y(sf2), .rm(c_srm),
-        .done(fds64_done), .result(fds64_res), .flags(fds64_fl)
-    );
+    generate if (FAST_DIV) begin : g_sdiv_fast
+        fp_rcpdiv #(.EW(11), .MW(52), .DIV_STEPS(3), .SQRT_STEPS(3)) sdiv64 (
+            .clk(clk), .rst(rst), .start(sf_div_start && c_dbl), .is_sqrt(sfn == 5'b01011),
+            .x(sf1), .y(sf2), .rm(c_srm),
+            .done(fds64_done), .result(fds64_res), .flags(fds64_fl)
+        );
+    end else begin : g_sdiv_exact
+        fp_divsqrt #(.EW(11), .MW(52)) sdiv64 (
+            .clk(clk), .rst(rst), .start(sf_div_start && c_dbl), .is_sqrt(sfn == 5'b01011),
+            .x(sf1), .y(sf2), .rm(c_srm),
+            .done(fds64_done), .result(fds64_res), .flags(fds64_fl)
+        );
+    end endgenerate
     reg [2:0] c_frm;
     reg [4:0] fflags_acc;
 
@@ -707,15 +725,24 @@ module vpu_top #(
     // (the coprocessor runs one instruction at a time, so they never overlap).
     wire c_sfp_div = (c_kind == VK_SFP) && (c_instr[6:0] == 7'b1010011) &&
                      (c_instr[31:27] == 5'b00011 || c_instr[31:27] == 5'b01011);
-    fp_divsqrt #(.EW(8), .MW(23)) fdivsqrt (
-        .clk(clk), .rst(rst),
-        .start(c_sfp_div ? (sf_div_start && !c_dbl) : fdiv_start),
-        .is_sqrt(c_sfp_div ? (c_instr[31:27] == 5'b01011) : (c_funct6 == 6'b010011)),
-        .x(c_sfp_div ? unbox(sf1) : (c_funct6 == 6'b100001 ? fp_b : fp_a)),
-        .y(c_sfp_div ? unbox(sf2) : (c_funct6 == 6'b100001 ? fp_a : fp_b)),
-        .rm(c_sfp_div ? c_srm : c_frm),
-        .done(fdiv_done), .result(fdiv_result), .flags(fdiv_flags)
-    );
+    wire        fd32_start   = c_sfp_div ? (sf_div_start && !c_dbl) : fdiv_start;
+    wire        fd32_is_sqrt = c_sfp_div ? (c_instr[31:27] == 5'b01011) : (c_funct6 == 6'b010011);
+    wire [31:0] fd32_x = c_sfp_div ? unbox(sf1) : (c_funct6 == 6'b100001 ? fp_b : fp_a);
+    wire [31:0] fd32_y = c_sfp_div ? unbox(sf2) : (c_funct6 == 6'b100001 ? fp_a : fp_b);
+    wire [2:0]  fd32_rm = c_sfp_div ? c_srm : c_frm;
+    generate if (FAST_DIV) begin : g_fdiv_fast
+        fp_rcpdiv #(.EW(8), .MW(23), .DIV_STEPS(1), .SQRT_STEPS(1)) fdivsqrt (
+            .clk(clk), .rst(rst), .start(fd32_start), .is_sqrt(fd32_is_sqrt),
+            .x(fd32_x), .y(fd32_y), .rm(fd32_rm),
+            .done(fdiv_done), .result(fdiv_result), .flags(fdiv_flags)
+        );
+    end else begin : g_fdiv_exact
+        fp_divsqrt #(.EW(8), .MW(23)) fdivsqrt (
+            .clk(clk), .rst(rst), .start(fd32_start), .is_sqrt(fd32_is_sqrt),
+            .x(fd32_x), .y(fd32_y), .rm(fd32_rm),
+            .done(fdiv_done), .result(fdiv_result), .flags(fdiv_flags)
+        );
+    end endgenerate
 
     // ======================================================================
     // Memory address generation
@@ -731,17 +758,28 @@ module vpu_top #(
     wire [2:0] nx_f = nx_fld_adv ? fld + 3'd1 : 3'd0;
     wire nx_active = c_vm || mem_whole || v0s[nx_e[8:0]];
     wire mem_busy_req = (mem_rd || mem_wr) && !mem_setup;
-    wire mem_chain = (state == S_MEM) && mem_busy_req && mem_rvalid && !mem_load_pf && !mem_store_pf &&
-                     !(!nx_fld_adv && last_elem) && nx_active;
+    // Only contiguous accesses chain (unit stride incl. segments, whole register, mask, scalar FP):
+    // their next address is the current one plus the element size, a single add from registers.
+    // Strided and indexed accesses (stride multiply, index read from the VRF) take a setup cycle
+    // per element instead, so that logic never feeds the D-cache's early index.
+    wire mem_seq = (c_kind == VK_MEM_UNIT) || (c_kind == VK_MEM_WHOLE) || (c_kind == VK_MEM_MASK) ||
+                   c_is_sfp_mem;
+    wire mem_chain = (state == S_MEM) && mem_seq && mem_busy_req && mem_rvalid && !mem_load_pf &&
+                     !mem_store_pf && !(!nx_fld_adv && last_elem) && nx_active;
     // While an access is outstanding the address/data logic already works on the next element,
     // so a hit only selects it (mem_chain) instead of starting the index -> address chain.
     wire [9:0] ae = mem_busy_req ? nx_e : e;       // element whose address is generated
     wire [2:0] af = mem_busy_req ? nx_f : fld;
+    // Strided / indexed: the element's offset (stride * element, or the index read from the VRF)
+    // is registered in a preparation cycle (mem_prep) and added to the base in the next one.
+    reg  [31:0] off_q;
+    reg         mem_prep;
+    always @(posedge clk) off_q <= (c_kind == VK_MEM_INDEXED) ? idx_val : c_rs2 * {22'b0, ae};
+    wire mem_gather = (c_kind == VK_MEM_STRIDED) || (c_kind == VK_MEM_INDEXED);
     reg  [31:0] elem_addr;
     always @(*) begin
         case (c_kind)
-            VK_MEM_STRIDED: elem_addr = c_rs1 + c_rs2 * {22'b0, ae} + {29'b0, af} * mem_bytes;
-            VK_MEM_INDEXED: elem_addr = c_rs1 + idx_val + {29'b0, af} * mem_bytes;
+            VK_MEM_STRIDED, VK_MEM_INDEXED: elem_addr = c_rs1 + off_q + {29'b0, af} * mem_bytes;
             VK_MEM_WHOLE, VK_MEM_MASK: elem_addr = c_rs1 + ({22'b0, ae} << c_eew_d);
             VK_SFLD, VK_SFST: elem_addr = c_rs1 + {20'b0, ae, 2'b00};
             default:        elem_addr = c_rs1 + ({22'b0, ae} * ({29'b0, c_nf} + 32'd1) + {29'b0, af}) * mem_bytes;
@@ -755,7 +793,10 @@ module vpu_top #(
     // An access is set up one cycle before it is requested, so the D-cache's early index
     // (mem_addr_next) always matches the address it then answers for.
     reg mem_setup;
-    assign mem_addr_next = mem_chain ? elem_addr : mem_addr;
+    wire [31:0] seq_step = (c_kind == VK_MEM_WHOLE || c_kind == VK_MEM_MASK) ? (32'd1 << c_eew_d) :
+                           c_is_sfp_mem ? 32'd4 : mem_bytes;
+    wire [31:0] seq_addr = mem_addr + seq_step;       // next contiguous address
+    assign mem_addr_next = mem_chain ? seq_addr : mem_addr;
     assign mem_own = (state == S_MEM);
 
     // ======================================================================
@@ -777,6 +818,26 @@ module vpu_top #(
                 2'd0: begin wr_mask = 32'hFF << {offD[1:0], 3'b0}; wr_val = {4{val[7:0]}}; end
                 2'd1: begin wr_mask = 32'hFFFF << {offD[1], 4'b0}; wr_val = {2{val[15:0]}}; end
                 default: begin wr_mask = 32'hFFFFFFFF; wr_val = val; end
+            endcase
+        end
+    endtask
+
+    // Divide and memory results are written straight from S_DIV / S_MEM, never through the
+    // S_RUN result logic: keeping them in separate registers (ow_*) leaves no structural path
+    // from the multicycle compute logic (FMA, ALU) to the VRF write port.
+    reg        ow_en;
+    reg [8:0]  ow_word;
+    reg [31:0] ow_mask;
+    reg [31:0] ow_val;
+    task put_other;
+        input [31:0] val;
+        begin
+            ow_en = 1'b1;
+            ow_word = {5'b0, offD[5:2]};
+            case (eewD)
+                2'd0: begin ow_mask = 32'hFF << {offD[1:0], 3'b0}; ow_val = {4{val[7:0]}}; end
+                2'd1: begin ow_mask = 32'hFFFF << {offD[1], 4'b0}; ow_val = {2{val[15:0]}}; end
+                default: begin ow_mask = 32'hFFFFFFFF; ow_val = val; end
             endcase
         end
     endtask
@@ -945,6 +1006,8 @@ module vpu_top #(
             rB = c_vs1 + {1'b0, f_reg};
             rD = c_vd + {1'b0, f_reg};
         end
+        rD_elem = rD;
+        if (ow_en_q) rD = ow_reg_q;
     end
 
     // ---------------- Captured element results (end of ph 4) ----------------
@@ -964,11 +1027,27 @@ module vpu_top #(
             mcy_sat <= r_sat;
         end
     end
-    wire        wp_run  = (state == S_RUN);
-    wire        wp_en   = wp_run ? (ph == PH_WR && mcy_wr_en) : wr_en;
-    wire [8:0]  wp_word = wp_run ? mcy_wr_word : wr_word;
-    wire [31:0] wp_mask = wp_run ? mcy_wr_mask : wr_mask;
-    wire [31:0] wp_val  = wp_run ? mcy_wr_val : wr_val;
+    // Divide and memory results (ow_*) are registered and written one cycle later: a vector
+    // load's data comes straight from the D-cache response, which is already a long path, and
+    // the merge into all sixteen banks would add to it. The merge reads the register at write
+    // time (port D is pointed at ow_reg_q for that cycle), so back-to-back elements of one word
+    // still combine correctly, and a segment load's next field cannot redirect it. An S_RUN element
+    // write (ph 5) can never coincide with a delayed write (it is at least five cycles later).
+    always @(posedge clk or posedge rst) begin
+        if (rst) ow_en_q <= 1'b0;
+        else     ow_en_q <= ow_en;
+    end
+    always @(posedge clk) begin
+        ow_reg_q <= rD_elem;
+        ow_word_q <= ow_word;
+        ow_mask_q <= ow_mask;
+        ow_val_q <= ow_val;
+    end
+    wire        wp_run  = (state == S_RUN) && (ph == PH_WR) && mcy_wr_en;
+    wire        wp_en   = ow_en_q || wp_run;
+    wire [8:0]  wp_word = ow_en_q ? ow_word_q : mcy_wr_word;
+    wire [31:0] wp_mask = ow_en_q ? ow_mask_q : mcy_wr_mask;
+    wire [31:0] wp_val  = ow_en_q ? ow_val_q : mcy_wr_val;
 
     // Operand fetch (ph 0, and ph 1 for gathers)
     always @(posedge clk) begin
@@ -1076,6 +1155,10 @@ module vpu_top #(
         wr_word = 9'b0;
         wr_mask = 32'b0;
         wr_val = 32'b0;
+        ow_en = 1'b0;
+        ow_word = 9'b0;
+        ow_mask = 32'b0;
+        ow_val = 32'b0;
         step_done = 1'b0;
         div_req = 1'b0;
         sel_val = 32'b0;
@@ -1177,18 +1260,18 @@ module vpu_top #(
             if (fdiv_op) begin
                 if (fdiv_done) begin
                     step_done = 1'b1;
-                    put_elem(fdiv_result);
+                    put_other(fdiv_result);
                 end
             end else begin
                 div_req = 1'b1;
                 if (div_ready) begin
                     step_done = 1'b1;
-                    put_elem(div_result);
+                    put_other(div_result);
                 end
             end
         end else if (state == S_MEM) begin
             if (c_load && mem_rvalid && !mem_load_pf && !c_is_sfp_mem) begin
-                put_elem(mem_rdata);
+                put_other(mem_rdata);
             end
         end
     end
@@ -1239,6 +1322,7 @@ module vpu_top #(
             mem_load_type <= 3'b0;
             fault_hit <= 1'b0;
             mem_setup <= 1'b0;
+            mem_prep <= 1'b0;
             fflags_acc <= 5'b0;
             fflags_set <= 5'b0;
             f_beat <= 5'd0;
@@ -1395,7 +1479,10 @@ module vpu_top #(
                         if (!(c_vm || mem_whole) && !v0s[e[8:0]]) begin
                             if (last_elem) state <= S_DONE;
                             else e <= e + 10'd1;
+                        end else if (mem_gather && !mem_prep) begin
+                            mem_prep <= 1'b1;           // off_q takes this element's offset
                         end else begin
+                            mem_prep <= 1'b0;
                             mem_addr <= elem_addr;
                             mem_setup <= 1'b1;
                             mem_wdata <= st_data;
@@ -1424,7 +1511,12 @@ module vpu_top #(
                     end else if (mem_rvalid) begin
                         if (mem_chain) begin
                             // next access goes out at once
-                            mem_addr <= elem_addr;
+                            mem_addr <= seq_addr;
+`ifndef SYNTHESIS
+                            if (seq_addr != elem_addr)
+                                $display("vpu: chained address %h != element address %h (kind %0d)",
+                                         seq_addr, elem_addr, c_kind);
+`endif
                             mem_wdata <= st_data;
                         end else begin
                             mem_rd <= 1'b0;

@@ -41,6 +41,8 @@ M_SCRATCH = 0x1000_0800
 LOOPS = 8
 # Each AMO is a read then a write, so MEM waits even when memory answers in the same cycle.
 AMO_COUNT = LOOPS
+# Each SC checks its reservation in its first MEM cycle and writes in the second (atomic_lsu).
+SC_COUNT = LOOPS
 LATENCIES = [0, 1, 2, 4]
 SWEEP_LATENCY = 2
 # Extra build with fast fetch and slow data, so instructions arrive back to back behind a waiting store.
@@ -308,9 +310,10 @@ async def test_program_is_latency_independent(dut):
                   f"{result.wait_cycles} wait cycles, {len(result.stores)} result stores")
 
     if latency == 0:
-        assert result.wait_cycles == AMO_COUNT, (
+        assert result.wait_cycles == AMO_COUNT + SC_COUNT, (
             f"a memory that answers in the same cycle should only make MEM wait for the write phase of "
-            f"each of the {AMO_COUNT} AMOs, but it waited {result.wait_cycles} cycles")
+            f"each of the {AMO_COUNT} AMOs and the reservation check of each of the {SC_COUNT} SCs, "
+            f"but it waited {result.wait_cycles} cycles")
         return
 
     base = json.loads(_reference_path(0).read_text())

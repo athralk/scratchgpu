@@ -18,6 +18,7 @@ module atomic_lsu (
     output wire atomic_read_enable,
     output wire atomic_write_enable,
     output wire sc_success,
+    output wire sc_wait,                // SC spends its first MEM cycle checking the reservation
     output wire [31:0] sc_result,
     output reg [31:0] atomic_new_word
 );
@@ -56,9 +57,24 @@ module atomic_lsu (
 
     assign atomic_read_enable = is_lr_w || is_amo_w;
     assign atomic_word_aligned = (mem_addr_mem[1:0] == 2'b00);
-    assign sc_success = is_sc_w && atomic_word_aligned && lr_valid &&
-                        (lr_addr == mem_addr_mem);
-    assign atomic_write_enable = (is_sc_w && sc_success) || is_amo_w;
+    // SC checks its reservation (a 30-bit address compare) in its first MEM cycle and writes in
+    // the second, so the write enable comes from a register: the compare is not in front of the
+    // D-cache request. The core holds MEM while sc_wait is high.
+    reg sc_checked, sc_ok;
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            sc_checked <= 1'b0;
+            sc_ok <= 1'b0;
+        end else if (!mem_hold) begin
+            sc_checked <= 1'b0;                 // the instruction leaves MEM
+        end else if (is_sc_w && !sc_checked) begin
+            sc_checked <= 1'b1;
+            sc_ok <= atomic_word_aligned && lr_valid && (lr_addr == mem_addr_mem);
+        end
+    end
+    assign sc_wait = is_sc_w && !sc_checked;
+    assign sc_success = is_sc_w && sc_checked && sc_ok;
+    assign atomic_write_enable = sc_success || is_amo_w;
     assign sc_result = sc_success ? 32'h0 : 32'h1;
 
     assign old_word_signed = mem_read_data;

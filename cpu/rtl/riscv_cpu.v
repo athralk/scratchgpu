@@ -461,6 +461,7 @@ module riscv_cpu (
     wire atomic_read_enable;
     wire atomic_write_enable;
     wire sc_success;
+    wire sc_wait;
     wire [31:0] sc_result;
     wire [31:0] atomic_new_word;
     // FENCE must wait for any queued store to drain.
@@ -474,7 +475,8 @@ module riscv_cpu (
     assign mem_wait = ((module_mem_rd_en || module_mem_wr_en) &&
                        !(module_data_rvalid_in && !amo_read_phase) &&
                        !mem_stage_page_fault_taken) ||
-                      (vec_wait && !mem_stage_page_fault_taken);
+                      (vec_wait && !mem_stage_page_fault_taken) ||
+                      sc_wait;                    // SC's reservation-check cycle
     assign ex_stage_active = !mem_wait;
     wire pipeline_hold = wfi_stall || store_buf_busy_stall || fence_drain_stall || mem_wait || muldiv_busy ||
                          vcsr_stall;
@@ -857,8 +859,10 @@ module riscv_cpu (
         .instr_id_mem(ex_mem_inst0_instr_id_out),
         .mem_addr_mem(ex_mem_inst0_mem_addr_out),
         .rs2_value_mem(ex_mem_inst0_rs2_value_out),
-        // In the write phase the new word is computed from the value the read returned.
-        .mem_read_data(amo_write_phase ? amo_read_data : mem_read_data_effective),
+        // The new word is only written in the write phase, from the value the read returned
+        // (registered). Feeding the live load data in the read phase too would leave a
+        // never-used path from the D-cache response through the AMO ALU to the store data.
+        .mem_read_data(amo_read_data),
         .mem_hold(mem_wait),
         .non_atomic_store_write_enable(non_atomic_store_write_enable),
         .non_atomic_store_write_addr(non_atomic_store_write_addr),
@@ -868,6 +872,7 @@ module riscv_cpu (
         .atomic_read_enable(atomic_read_enable),
         .atomic_write_enable(atomic_write_enable),
         .sc_success(sc_success),
+        .sc_wait(sc_wait),
         .sc_result(sc_result),
         .atomic_new_word(atomic_new_word)
     );
@@ -1011,8 +1016,10 @@ module riscv_cpu (
     assign module_mem_wr_en = (atomic_write_enable && (!is_amo_w || amo_write_phase)) ||
                               ex_mem_std_store_direct_req || store_buf_commit_fire;
     assign module_mem_rd_en = read_needs_memory;
-    assign module_write_addr = atomic_write_enable ? ex_mem_inst0_mem_addr_out :
-                               (ex_mem_std_store_direct_req ? ex_mem_store_addr : store_buf_addr);
+    // AMO/SC and direct stores all write at the MEM address (ex_mem_store_addr is the same
+    // value); only a store-buffer commit uses another. Selecting on the commit keeps
+    // atomic_write_enable out of the address that the data TLB compares.
+    assign module_write_addr = store_buf_commit_fire ? store_buf_addr : ex_mem_inst0_mem_addr_out;
     assign module_read_addr = ex_mem_read_addr;
     assign module_wr_data_out = atomic_write_enable ?
                                 (is_amo_w ? atomic_new_word : ex_mem_inst0_rs2_value_out) :

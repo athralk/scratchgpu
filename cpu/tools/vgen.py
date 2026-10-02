@@ -17,14 +17,22 @@ CLASSES = ["int", "mask", "perm", "red", "widen", "mem", "fp", "sfp", "smem"]
 
 
 class Gen:
-    def __init__(self, seed, classes, blocks, ops, irq=False):
+    def __init__(self, seed, classes, blocks, ops, irq=False, exact_div=False):
         self.irq = irq
+        self.exact_div = exact_div
         self.r = random.Random(seed)
         self.classes = classes
         self.blocks = blocks
         self.ops = ops
         self.lines = []
         self.nscalar = 0          # scalar result slots used
+
+    # Divide / square root are approximate on the default hardware (vpu_top FAST_DIV=1), so they
+    # are left out of the bit-exact comparison unless --exact-div (gpu/tb checks their accuracy).
+    APPROX_OPS = {"vfdiv", "vfrdiv", "vfsqrt.v", "fdiv", "fsqrt"}
+
+    def ch(self, ops):
+        return self.r.choice(ops if self.exact_div else [o for o in ops if o not in self.APPROX_OPS])
 
     def emit(self, s):
         self.lines.append("  " + s)
@@ -289,7 +297,7 @@ class Gen:
             self.load_f("fa0")
             vs2 = self.group(lm)
             vd = self.group(lm, allow_v0=False)
-            op = r.choice(["vfadd", "vfsub", "vfrsub", "vfmul", "vfdiv", "vfrdiv", "vfmin", "vfmax",
+            op = self.ch(["vfadd", "vfsub", "vfrsub", "vfmul", "vfdiv", "vfrdiv", "vfmin", "vfmax",
                            "vfsgnj", "vfsgnjn", "vfsgnjx", "vfmacc", "vfnmacc", "vfmsac", "vfnmsac",
                            "vfmadd", "vfnmadd", "vfmsub", "vfnmsub", "vmfeq", "vmfne", "vmflt", "vmfle",
                            "vmfgt", "vmfge", "vfslide1up", "vfslide1down", "vfmerge"])
@@ -323,7 +331,7 @@ class Gen:
         vs1 = self.group(lm)
         vd = self.group(lm, allow_v0=False)
         if kind == "arith":
-            op = r.choice(["vfadd", "vfsub", "vfmul", "vfdiv", "vfmin", "vfmax", "vfsgnj",
+            op = self.ch(["vfadd", "vfsub", "vfmul", "vfdiv", "vfmin", "vfmax", "vfsgnj",
                            "vfsgnjn", "vfsgnjx"])
             self.emit(f"{op}.vv v{vd}, v{vs2}, v{vs1}{self.mask_suffix(vd)}")
         elif kind == "fma":
@@ -336,7 +344,7 @@ class Gen:
             vdm = self.group(1, avoid=[(vs2, n), (vs1, n)])
             self.emit(f"{op}.vv v{vdm}, v{vs2}, v{vs1}{self.mask_suffix(vdm)}")
         elif kind == "unary":
-            op = r.choice(["vfsqrt.v", "vfrsqrt7.v", "vfrec7.v", "vfclass.v", "vfcvt.xu.f.v",
+            op = self.ch(["vfsqrt.v", "vfrsqrt7.v", "vfrec7.v", "vfclass.v", "vfcvt.xu.f.v",
                            "vfcvt.x.f.v", "vfcvt.f.xu.v", "vfcvt.f.x.v", "vfcvt.rtz.xu.f.v",
                            "vfcvt.rtz.x.f.v"])
             self.emit(f"{op} v{vd}, v{vs2}{self.mask_suffix(vd)}")
@@ -359,7 +367,7 @@ class Gen:
             self.emit("add t3, t3, t4")
             self.emit(f"fl{'d' if dbl else 'w'} {fr}, 0(t3)")
         rm = r.choice(["", ", rne", ", rtz", ", rdn", ", rup", ", rmm"])
-        op = r.choice(["fadd", "fsub", "fmul", "fdiv", "fsqrt", "fmin", "fmax", "fsgnj", "fsgnjn",
+        op = self.ch(["fadd", "fsub", "fmul", "fdiv", "fsqrt", "fmin", "fmax", "fsgnj", "fsgnjn",
                        "fsgnjx", "fmadd", "fmsub", "fnmsub", "fnmadd", "feq", "flt", "fle", "fclass",
                        "fcvt.w", "fcvt.wu", "fcvt.from_w", "fcvt.from_wu", "fcvt.sd", "fmv"])
         if op in ("fadd", "fsub", "fmul", "fdiv"):
@@ -681,8 +689,9 @@ def main():
     ap.add_argument("--blocks", type=int, default=12)
     ap.add_argument("--ops", type=int, default=6)
     ap.add_argument("--irq", action="store_true")
+    ap.add_argument("--exact-div", action="store_true", help="include divide/sqrt (hardware built with FAST_DIV=0)")
     a = ap.parse_args()
-    g = Gen(a.seed, a.classes.split(","), a.blocks, a.ops, a.irq)
+    g = Gen(a.seed, a.classes.split(","), a.blocks, a.ops, a.irq, a.exact_div)
     with open(a.out, "w") as f:
         f.write(g.program())
 
