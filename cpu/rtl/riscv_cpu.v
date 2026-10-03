@@ -610,7 +610,9 @@ module riscv_cpu (
         .vset_we(vset_we),
         .vset_vl(vset_vl),
         .vset_vtype(vset_vtype),
-        .vec_retire(vec_retire_mem),
+        // Scalar FP also runs on the vector unit, but it only dirties FS (fp_retire below);
+        // marking VS dirty made Linux save vector state for tasks that never set any up.
+        .vec_retire(vec_retire_mem && !mem_is_fp),
         .vec_fault_we(vec_fault),
         .vec_fault_vstart(vec_resp_fault_vstart),
         .vec_vl_we(vec_resp_done && vec_resp_vl_valid && !vec_resp_fault),

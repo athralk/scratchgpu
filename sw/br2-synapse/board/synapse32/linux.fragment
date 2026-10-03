@@ -50,3 +50,8 @@ CONFIG_CMDLINE="console=ttyS0,115200 earlycon=uart8250,mmio32,0x20000000 rdinit=
 # CONFIG_SECURITY is not set
 # CONFIG_CGROUPS is not set
 # CONFIG_PERF_EVENTS is not set
+# Built-in initramfs stored uncompressed: the gzip path ends in "junk at the end of compressed
+# archive" on Spike as well as on the SoC, with a valid archive (under investigation).
+# (The source is set here too: the compression choice only exists once it is non-empty.)
+CONFIG_INITRAMFS_SOURCE="${BR_BINARIES_DIR}/rootfs.cpio"
+CONFIG_INITRAMFS_COMPRESSION_NONE=y

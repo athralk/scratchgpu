@@ -797,7 +797,12 @@ module vpu_top #(
                            c_is_sfp_mem ? 32'd4 : mem_bytes;
     wire [31:0] seq_addr = mem_addr + seq_step;       // next contiguous address
     assign mem_addr_next = mem_chain ? seq_addr : mem_addr;
-    assign mem_own = (state == S_MEM);
+    // mem_own selects the D-cache port (address, data, enables) for the vector unit. It is a
+    // register of its own instead of a decode of state: the decode plus its fanout sat at the
+    // start of the D-cache -> CPU stall path. It rises with S_MEM and falls one cycle after it,
+    // in S_DONE, when the unit issues nothing and the core still waits for the response.
+    (* max_fanout = 32 *) reg mem_own_q;
+    assign mem_own = mem_own_q;
 
     // ======================================================================
     // Main sequencer
@@ -1299,6 +1304,7 @@ module vpu_top #(
     always @(posedge clk or posedge rst) begin
         if (rst) begin
             state <= S_IDLE;
+            mem_own_q <= 1'b0;
             e <= 10'd0;
             fld <= 3'd0;
             evl <= 10'd0;
@@ -1384,6 +1390,7 @@ module vpu_top #(
                         state <= S_SFP;
                     end else if (dec_is_load || dec_is_store) begin
                         state <= (q_vstart[q_head][9:0] >= start_evl) ? S_DONE : S_MEM;
+                        mem_own_q <= (q_vstart[q_head][9:0] < start_evl);
                     end else if (dec_kind == VK_XUNARY && h_instr[19:15] == 5'd0) begin
                         state <= S_DONE;     // vmv.x.s / vfmv.f.s: no loop
                     end else if (h_fast) begin
@@ -1535,6 +1542,7 @@ module vpu_top #(
                 S_DONE: begin
                     q_pop <= 1'b1;
                     state <= S_IDLE;
+                    mem_own_q <= 1'b0;
                     if (c_scalar || c_load || c_store) begin
                         resp_valid <= 1'b1;
                         resp_fault <= fault_hit;
@@ -1546,7 +1554,10 @@ module vpu_top #(
                     end
                 end
 
-                default: state <= S_IDLE;
+                default: begin
+                    state <= S_IDLE;
+                    mem_own_q <= 1'b0;
+                end
             endcase
         end
     end

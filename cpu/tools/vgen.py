@@ -612,6 +612,10 @@ class Gen:
         self.emit("csrs mstatus, t0")
         self.emit("fsflags zero")
         self.emit("csrs mstatus, t0")
+        # The f registers have no reset value (on the board they hold the previous program's
+        # values; Spike starts them at 0), and some ops leave fa3 unwritten before it is stored.
+        for i in range(32):
+            self.emit(f"fcvt.d.w f{i}, zero")
         self.emit("la s2, ssig")
         if self.irq:
             # Frequent machine timer interrupts. The handler leaves no architectural trace,
